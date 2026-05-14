@@ -6,16 +6,17 @@ python app.py
 Kontrol:
   Tab        = pindah panel (Library <-> Playlist)
   ↑ ↓        = navigasi
-  Enter      = play / pilih
+  Enter      = play / pilih / konfirmasi
   Space      = pause/resume
   n / p      = next / prev
   + / -      = volume naik / turun
   r          = toggle repeat (off -> all -> 1)
-  /          = cari lagu
-  d          = download lagu dari YouTube
+  /          = cari lagu lokal (real-time filter)
+  d          = download dari YouTube (tampilkan hasil pencarian)
   k          = tampilkan lirik
   1 2 3      = ganti tab
-  q / Esc    = keluar
+  Esc        = batal / kembali
+  q          = keluar
 """
 
 import os, re, sys, time, threading, msvcrt
@@ -45,9 +46,8 @@ try:
 except ImportError:
     HAS_YTDLP = False
 
-# ── palette cmus: hijau / cyan di atas hitam ───────────
+# ── palette cmus ───────────────────────────────────────
 C_GREEN   = "bright_green"
-C_CYAN    = "cyan"
 C_WHITE   = "white"
 C_DIM     = "grey46"
 C_YELLOW  = "yellow"
@@ -73,18 +73,22 @@ REPEAT_ALL   = "all"
 REPEAT_TRACK = "track"
 repeat_mode  : str = REPEAT_OFF
 
-active_panel : str = "playlist"   # "library" | "playlist"
+active_panel : str = "playlist"
 lib_sel      : int = 0
 pl_sel       : int = 0
 
 # ── download state ─────────────────────────────────────
-dl_status    : str = ""          # pesan progress download
-dl_active    : bool = False      # sedang download?
+dl_status    : str  = ""
+dl_active    : bool = False
 dl_lock      = threading.Lock()
+
+# ── YouTube search results state ───────────────────────
+yt_results   : list[dict] = []   # [{title, duration, url, channel}, ...]
+yt_searching : bool = False
+yt_lock      = threading.Lock()
 
 LIBRARY_ITEMS = [
     ("All Songs",  "library"),
-    ("Playlist",   "playlist_view"),
     ("──────────", "sep"),
     ("Search /",   "search"),
     ("Download d", "download"),
@@ -246,72 +250,102 @@ def check_song_end():
         next_song()
 
 # ══════════════════════════════════════════════════════
-#  DOWNLOAD (yt-dlp)
+#  DOWNLOAD + YOUTUBE SEARCH (yt-dlp)
 # ══════════════════════════════════════════════════════
 def _dl_progress_hook(d: dict):
     global dl_status
     status = d.get("status", "")
     if status == "downloading":
-        pct    = d.get("_percent_str", "??%").strip()
-        speed  = d.get("_speed_str",  "??").strip()
-        eta    = d.get("_eta_str",    "??").strip()
-        fname  = Path(d.get("filename", "")).stem[:30]
+        pct   = d.get("_percent_str", "??%").strip()
+        speed = d.get("_speed_str",   "?? ").strip()
+        eta   = d.get("_eta_str",     "??").strip()
+        fname = Path(d.get("filename", "")).stem[:35]
         with dl_lock:
-            dl_status = f"dl  {fname}  {pct}  {speed}  eta {eta}"
+            dl_status = f"{fname}  {pct}  {speed}  eta {eta}"
     elif status == "finished":
         with dl_lock:
-            dl_status = f"dl  selesai — konversi ke mp3..."
+            dl_status = "mengonversi ke mp3..."
     elif status == "error":
         with dl_lock:
-            dl_status = f"dl  ERROR"
+            dl_status = "ERROR saat download"
 
-def _download_thread(query: str):
-    global dl_active, dl_status
+def _yt_search_thread(query: str):
+    """Cari 7 hasil di YouTube tanpa download."""
+    global yt_results, yt_searching
     if not HAS_YTDLP:
-        with dl_lock: dl_status = "ERROR: yt-dlp tidak terinstall  (pip install yt-dlp)"
-        time.sleep(3)
-        with dl_lock: dl_status = ""; dl_active = False
+        with yt_lock:
+            yt_results = [{"title": "yt-dlp tidak terinstall (pip install yt-dlp)",
+                           "duration": "", "url": "", "channel": ""}]
+            yt_searching = False
         return
 
-    # jika bukan URL YouTube, cari dulu
-    is_url = query.startswith("http://") or query.startswith("https://")
-    search_q = query if is_url else f"ytsearch1:{query}"
-
     ydl_opts = {
-        "format":           "bestaudio/best",
-        "outtmpl":          str(MUSIC_FOLDER / "%(title)s.%(ext)s"),
-        "postprocessors":   [{
-            "key":            "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
-        "progress_hooks":   [_dl_progress_hook],
-        "quiet":            True,
-        "no_warnings":      True,
-        "noplaylist":       True,
+        "quiet":        True,
+        "no_warnings":  True,
+        "extract_flat": True,
+        "noplaylist":   True,
     }
-
     try:
-        with dl_lock: dl_status = f"mencari: {query[:40]}..."
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([search_q])
-        with dl_lock: dl_status = "selesai! tekan r untuk refresh playlist"
-        time.sleep(2.5)
-    except Exception as e:
-        with dl_lock: dl_status = f"ERROR: {str(e)[:60]}"
-        time.sleep(3)
+            info = ydl.extract_info(f"ytsearch7:{query}", download=False)
+        entries = info.get("entries", []) if info else []
+        results = []
+        for e in entries:
+            dur_s = e.get("duration") or 0
+            m, s  = divmod(int(dur_s), 60)
+            results.append({
+                "title":   e.get("title",   "?")[:65],
+                "channel": e.get("uploader", e.get("channel", "?"))[:25],
+                "duration": f"{m}:{s:02d}" if dur_s else "-:--",
+                "url":     e.get("url") or e.get("webpage_url", ""),
+            })
+        with yt_lock:
+            yt_results   = results
+            yt_searching = False
+    except Exception as ex:
+        with yt_lock:
+            yt_results   = [{"title": f"Error: {str(ex)[:60]}", "duration": "",
+                             "url": "", "channel": ""}]
+            yt_searching = False
 
+def start_yt_search(query: str):
+    global yt_results, yt_searching
+    with yt_lock:
+        yt_results   = []
+        yt_searching = True
+    threading.Thread(target=_yt_search_thread, args=(query,), daemon=True).start()
+
+def _download_url_thread(url: str, title: str):
+    global dl_active, dl_status
+    ydl_opts = {
+        "format":         "bestaudio/best",
+        "outtmpl":        str(MUSIC_FOLDER / "%(title)s.%(ext)s"),
+        "postprocessors": [{"key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3", "preferredquality": "192"}],
+        "progress_hooks": [_dl_progress_hook],
+        "quiet":          True,
+        "no_warnings":    True,
+        "noplaylist":     True,
+    }
+    try:
+        with dl_lock: dl_status = f"memulai: {title[:40]}..."
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        with dl_lock: dl_status = f"selesai: {title[:40]}"
+        time.sleep(2)
+    except Exception as e:
+        with dl_lock: dl_status = f"ERROR: {str(e)[:55]}"
+        time.sleep(3)
     with dl_lock:
         dl_status = ""
         dl_active = False
-    # refresh playlist otomatis
     scan_music()
 
-def start_download(query: str):
+def start_download_url(url: str, title: str):
     global dl_active
     if dl_active: return
     dl_active = True
-    threading.Thread(target=_download_thread, args=(query,), daemon=True).start()
+    threading.Thread(target=_download_url_thread, args=(url, title), daemon=True).start()
 
 # ══════════════════════════════════════════════════════
 #  RENDER COMPONENTS
@@ -338,7 +372,6 @@ def vol_bar(width: int = 8) -> str:
     return (f"[{C_GREEN}]" + "█" * filled + f"[/{C_GREEN}]"
             + f"[{C_DIM}]" + "░" * (width - filled) + f"[/{C_DIM}]")
 
-# ── Tab bar ────────────────────────────────────────────
 def make_tab_bar(view: str) -> Text:
     tabs = [("1:library", "library"), ("2:playlist", "playlist"), ("3:lyrics", "karaoke")]
     t = Text()
@@ -351,28 +384,37 @@ def make_tab_bar(view: str) -> Text:
     return t
 
 # ── Status bar ─────────────────────────────────────────
-def make_status_bar(search_mode: bool = False, kw: str = "",
-                    dl_mode: bool = False, dl_kw: str = "") -> Text:
-    # download input mode
-    if dl_mode:
+def make_status_bar(mode: str = "normal", input_text: str = "") -> Text:
+    # mode: normal | search_input | dl_input | dl_results | dl_progress
+    if mode == "search_input":
         t = Text()
-        t.append(" d ", style=f"bold {C_GREEN}")
-        t.append("YouTube: ", style=C_DIM)
-        t.append(dl_kw, style=C_WHITE)
+        t.append(" / ", style=f"bold {C_GREEN}")
+        t.append("cari lagu: ", style=C_DIM)
+        t.append(input_text, style=C_WHITE)
         t.append("█", style=C_GREEN)
         return t
 
-    # search input mode
-    if search_mode:
+    if mode == "dl_input":
         t = Text()
-        t.append(" /", style=f"bold {C_GREEN}")
-        t.append(kw, style=C_WHITE)
+        t.append(" d ", style=f"bold {C_YELLOW}")
+        t.append("cari YouTube: ", style=C_DIM)
+        t.append(input_text, style=C_WHITE)
         t.append("█", style=C_GREEN)
+        return t
+
+    if mode == "dl_results":
+        t = Text()
+        t.append(" ↑↓ ", style=f"bold {C_GREEN}")
+        t.append("pilih lagu  ", style=C_DIM)
+        t.append("Enter", style=f"bold {C_GREEN}")
+        t.append(":download  ", style=C_DIM)
+        t.append("Esc", style=f"bold {C_GREEN}")
+        t.append(":batal", style=C_DIM)
         return t
 
     # download progress
     with dl_lock:
-        dls = dl_status
+        dls      = dl_status
         dlactive = dl_active
     if dlactive or dls:
         t = Text(no_wrap=True)
@@ -380,22 +422,21 @@ def make_status_bar(search_mode: bool = False, kw: str = "",
         t.append(dls, style=C_YELLOW)
         return t
 
+    # normal playback
     t = Text(no_wrap=True)
     if not playlist:
-        t.append(" ♪  no song loaded", style=C_DIM)
+        t.append(" ♪  belum ada lagu — tekan d untuk download dari YouTube", style=C_DIM)
         return t
-
     song  = playlist[current_index].stem
     pos_s = max(pygame.mixer.music.get_pos()/1000, 0)
     dur   = 0
     if HAS_MUTAGEN:
         try: dur = mutagen.mp3.MP3(str(playlist[current_index])).info.length
         except: pass
-
-    icon  = "|| " if paused else ">> "
+    icon       = "|| " if paused else ">> "
     icon_style = C_YELLOW if paused else C_GREEN
     t.append(f" {icon}", style=f"bold {icon_style}")
-    t.append(song[:60], style=f"bold {C_WHITE}")
+    t.append(song[:55], style=f"bold {C_WHITE}")
     t.append(f"  {fmt_time(pos_s)}", style=C_GREEN)
     if dur: t.append(f"/{fmt_time(dur)}", style=C_DIM)
     t.append(f"  vol:{int(volume*100)}%", style=C_DIM)
@@ -405,21 +446,30 @@ def make_status_bar(search_mode: bool = False, kw: str = "",
     else:                             t.append("repeat:off", style=C_DIM)
     return t
 
-# ── Footer keybinds ───────────────────────────────────
-FOOTER_HINTS = (
+# ── Footer ─────────────────────────────────────────────
+FOOTER_NORMAL = (
     "Tab:panel", "↑↓:nav", "Enter:play", "spc:pause",
-    "n/p:skip",  "+/-:vol", "r:repeat",  "/:search",
-    "d:download", "k:lyrics", "q:quit",
+    "n/p:skip",  "+/-:vol", "r:repeat",
+    "/:cari",    "d:download", "k:lirik", "q:quit",
+)
+FOOTER_SEARCH = (
+    "ketik:filter real-time", "Enter:konfirmasi", "Esc:batal",
+)
+FOOTER_DL_INPUT = (
+    "ketik:judul/URL YouTube", "Enter:cari hasil", "Esc:batal",
+)
+FOOTER_DL_RESULTS = (
+    "↑↓:pilih", "Enter:download", "d:cari lagi", "Esc:batal",
 )
 
-def make_footer() -> Text:
+def make_footer(hints: tuple = FOOTER_NORMAL) -> Text:
     t = Text(no_wrap=True)
     t.append(" ")
-    for i, hint in enumerate(FOOTER_HINTS):
+    for i, hint in enumerate(hints):
         key, _, desc = hint.partition(":")
         t.append(key, style=f"bold {C_GREEN}")
         t.append(f":{desc}", style=C_DIM)
-        if i < len(FOOTER_HINTS) - 1:
+        if i < len(hints) - 1:
             t.append("  ")
     return t
 
@@ -437,50 +487,74 @@ def make_library_panel(focused: bool) -> Panel:
             t.append(f" ▶ {label}\n", style=f"{C_WHITE} {C_SEL_BG}")
         else:
             t.append(f"   {label}\n", style=C_DIM)
-
     border = C_GREEN if focused else C_BORDER
     title  = f"[{C_TITLE}]Library[/{C_TITLE}]" if focused else f"[{C_DIM}]Library[/{C_DIM}]"
     return Panel(t, title=title, border_style=border, box=box.SIMPLE_HEAVY, padding=(0,0))
 
 # ── Playlist pane ──────────────────────────────────────
 def make_playlist_panel(src: list[Path], title: str,
-                         focused: bool, height: int = 20) -> Panel:
+                         focused: bool, sel: int, height: int = 20) -> Panel:
     t = Text()
     if not src:
-        t.append("\n  (kosong — taruh .mp3 di folder ./music)\n", style=C_DIM)
+        t.append("\n  (kosong — taruh .mp3 di folder ./music  atau tekan d untuk download)\n",
+                 style=C_DIM)
     else:
         PAGE       = max(height - 2, 4)
-        page_start = (pl_sel // PAGE) * PAGE
+        page_start = (sel // PAGE) * PAGE
         page_end   = min(page_start + PAGE, len(src))
-
         for i in range(page_start, page_end):
-            song = src[i]
-            dur  = get_duration(song)
-            lrc  = "♪" if song.with_suffix(".lrc").exists() else " "
-            is_cur = playlist and (song == playlist[current_index])
+            song   = src[i]
+            dur    = get_duration(song)
+            lrc    = "♪" if song.with_suffix(".lrc").exists() else " "
+            is_cur = bool(playlist) and (song == playlist[current_index])
             arrow  = "▶" if is_cur else " "
-
-            name = song.stem
+            name   = song.stem
             if len(name) > 48: name = name[:46] + ".."
-
-            line = f" {arrow} {i+1:>3}  {name:<48}  {dur:>5}  {lrc}\n"
-
-            if i == pl_sel and focused:
-                style = f"bold {C_GREEN} {C_SEL_BG}"
-            elif i == pl_sel:
-                style = f"{C_WHITE} {C_SEL_BG}"
-            elif is_cur:
-                style = f"bold {C_GREEN}"
-            else:
-                style = C_DIM
+            line   = f" {arrow} {i+1:>3}  {name:<48}  {dur:>5}  {lrc}\n"
+            if i == sel and focused:     style = f"bold {C_GREEN} {C_SEL_BG}"
+            elif i == sel:               style = f"{C_WHITE} {C_SEL_BG}"
+            elif is_cur:                 style = f"bold {C_GREEN}"
+            else:                        style = C_DIM
             t.append(line, style=style)
-
-    border = C_GREEN if focused else C_BORDER
-    cnt    = len(src) if src else 0
+    border  = C_GREEN if focused else C_BORDER
+    cnt     = len(src) if src else 0
     title_s = (f"[{C_TITLE}]{title} ({cnt})[/{C_TITLE}]" if focused
                else f"[{C_DIM}]{title} ({cnt})[/{C_DIM}]")
-    return Panel(t, title=title_s, border_style=border,
-                 box=box.SIMPLE_HEAVY, padding=(0,0))
+    return Panel(t, title=title_s, border_style=border, box=box.SIMPLE_HEAVY, padding=(0,0))
+
+# ── YouTube search results pane ────────────────────────
+def make_yt_panel(results: list[dict], sel: int, searching: bool) -> Panel:
+    t = Text()
+    if searching:
+        t.append("\n  mencari di YouTube...\n", style=C_YELLOW)
+    elif not results:
+        t.append("\n  ketik judul lagu lalu Enter untuk mencari\n", style=C_DIM)
+    else:
+        t.append("\n")
+        for i, r in enumerate(results):
+            title   = r["title"]
+            dur     = r["duration"]
+            channel = r["channel"]
+            num     = f"{i+1:>2}."
+            line_top    = f"  {num} {title}\n"
+            line_bottom = f"       {channel}  {dur}\n"
+
+            if i == sel:
+                t.append(line_top,    style=f"bold {C_GREEN} {C_SEL_BG}")
+                t.append(line_bottom, style=f"{C_DIM} {C_SEL_BG}")
+            else:
+                t.append(line_top,    style=C_WHITE)
+                t.append(line_bottom, style=C_DIM)
+
+    # download active notice
+    with dl_lock:
+        dls = dl_status; dlact = dl_active
+    if dlact or dls:
+        t.append(f"\n  ↓ {dls}\n", style=C_YELLOW)
+
+    return Panel(t,
+                 title=f"[{C_TITLE}]YouTube — pilih lagu untuk download[/{C_TITLE}]",
+                 border_style=C_YELLOW, box=box.SIMPLE_HEAVY, padding=(0,0))
 
 # ── Lyrics pane ────────────────────────────────────────
 CONTEXT = 5
@@ -504,27 +578,27 @@ def make_lyric_panel() -> Panel:
             elif dist == 1: t.append(f"     {text}\n",     style=C_WHITE)
             elif dist == 2: t.append(f"     {text}\n",     style=C_GREEN)
             else:           t.append(f"     {text}\n",     style=C_DIM)
-
     return Panel(Align.center(t, vertical="middle"),
                  title=f"[{C_TITLE}]Lyrics[/{C_TITLE}]",
                  border_style=C_GREEN, box=box.SIMPLE_HEAVY)
 
 # ── Full layout ────────────────────────────────────────
-def build_layout(view: str, pl_src: list[Path], pl_title: str,
-                 search_mode: bool, kw: str, height: int,
-                 dl_mode: bool = False, dl_kw: str = "") -> Layout:
+def build_layout(view: str,
+                 pl_src: list[Path], pl_title: str, pl_sel_idx: int,
+                 mode: str, input_text: str,
+                 yt_res: list[dict], yt_sel: int, yt_srch: bool,
+                 height: int) -> Layout:
     root = Layout()
     root.split_column(
-        Layout(name="tabs",   size=1),
+        Layout(name="tabs",    size=1),
         Layout(name="body"),
         Layout(name="progbar", size=1),
-        Layout(name="status", size=1),
-        Layout(name="footer", size=1),
+        Layout(name="status",  size=1),
+        Layout(name="footer",  size=1),
     )
 
     root["tabs"].update(make_tab_bar(view))
 
-    # progress bar row
     pb = Text()
     pb.append("  ")
     pb.append(progress_bar(console.width - 20 if console.width else 60))
@@ -535,25 +609,33 @@ def build_layout(view: str, pl_src: list[Path], pl_title: str,
     body   = Layout()
     body_h = max(height - 5, 4)
     lib_w  = 20
-
     body.split_row(
         Layout(name="lib",  size=lib_w),
         Layout(name="main"),
     )
     body["lib"].update(make_library_panel(focused=(active_panel == "library")))
 
-    if view == "karaoke":
+    if mode in ("dl_input", "dl_results"):
+        # panel kanan: YouTube results
+        body["main"].update(make_yt_panel(yt_res, yt_sel, yt_srch))
+    elif view == "karaoke":
         body["main"].update(make_lyric_panel())
     else:
         body["main"].update(
             make_playlist_panel(pl_src, pl_title,
                                 focused=(active_panel == "playlist"),
-                                height=body_h)
+                                sel=pl_sel_idx, height=body_h)
         )
 
     root["body"].update(body)
-    root["status"].update(make_status_bar(search_mode, kw, dl_mode, dl_kw))
-    root["footer"].update(make_footer())
+    root["status"].update(make_status_bar(mode, input_text))
+
+    hint_map = {
+        "search_input": FOOTER_SEARCH,
+        "dl_input":     FOOTER_DL_INPUT,
+        "dl_results":   FOOTER_DL_RESULTS,
+    }
+    root["footer"].update(make_footer(hint_map.get(mode, FOOTER_NORMAL)))
     return root
 
 # ══════════════════════════════════════════════════════
@@ -562,16 +644,21 @@ def build_layout(view: str, pl_src: list[Path], pl_title: str,
 def main_loop():
     global active_panel, lib_sel, pl_sel
 
-    view        = "library"
-    search_mode = False
-    kw          = ""
-    dl_mode     = False
-    dl_kw       = ""
-    pl_src      : list[Path] = list(playlist)
-    pl_title    = "All Songs"
+    view      = "library"
+    mode      = "normal"   # normal | search_input | dl_input | dl_results
+    input_txt = ""
+
+    pl_src   : list[Path] = list(playlist)
+    pl_title  = "All Songs"
+    pl_sel_v  = 0          # navigasi di playlist (lokal, bisa beda dari pl_sel)
+
+    yt_sel    = 0
 
     try:    rows = os.get_terminal_size().lines
     except: rows = 30
+
+    def _get_yt():
+        with yt_lock: return list(yt_results), yt_searching
 
     with Live(console=console, refresh_per_second=8, screen=True) as live:
         while True:
@@ -579,50 +666,99 @@ def main_loop():
             try:    rows = os.get_terminal_size().lines
             except: pass
 
-            live.update(build_layout(view, pl_src, pl_title,
-                                     search_mode, kw, rows, dl_mode, dl_kw))
+            res, srch = _get_yt()
+            live.update(build_layout(
+                view, pl_src, pl_title, pl_sel_v,
+                mode, input_txt, res, yt_sel, srch, rows
+            ))
 
             if not msvcrt.kbhit():
-                time.sleep(0.07)
+                time.sleep(0.06)
                 continue
 
             k = read_key()
 
-            # ── Download input mode ───────────────────
-            if dl_mode:
+            # ══════════════════════════════════════════
+            #  MODE: dl_input — ketik query YouTube
+            # ══════════════════════════════════════════
+            if mode == "dl_input":
                 if k == KEY_ESC:
-                    dl_mode = False; dl_kw = ""
+                    mode = "normal"; input_txt = ""
                 elif k == KEY_ENTER:
-                    if dl_kw.strip():
-                        start_download(dl_kw.strip())
-                    dl_mode = False; dl_kw = ""
-                elif k in ("\x08", "backspace"):
-                    dl_kw = dl_kw[:-1]
-                elif len(k) == 1 and k.isprintable():
-                    dl_kw += k
-                continue
-
-            # ── Search mode ──────────────────────────
-            if search_mode:
-                if k == KEY_ESC:
-                    search_mode = False; kw = ""
-                    pl_src = list(playlist); pl_title = "All Songs"; pl_sel = 0
-                elif k == KEY_ENTER:
-                    search_mode = False
-                    if kw:
-                        pl_src  = [p for p in playlist if kw.lower() in p.stem.lower()]
-                        pl_title = f"/{kw}"
+                    if input_txt.strip():
+                        start_yt_search(input_txt.strip())
+                        mode = "dl_results"; yt_sel = 0
                     else:
-                        pl_src = list(playlist); pl_title = "All Songs"
-                    pl_sel = 0; active_panel = "playlist"
+                        mode = "normal"; input_txt = ""
                 elif k in ("\x08", "backspace"):
-                    kw = kw[:-1]
+                    input_txt = input_txt[:-1]
                 elif len(k) == 1 and k.isprintable():
-                    kw += k
+                    input_txt += k
                 continue
 
-            # ── Global hotkeys ───────────────────────
-            if   k in ("q", KEY_ESC):         stop_music(); break
+            # ══════════════════════════════════════════
+            #  MODE: dl_results — pilih hasil YouTube
+            # ══════════════════════════════════════════
+            if mode == "dl_results":
+                res, srch = _get_yt()
+                if k == KEY_ESC:
+                    mode = "normal"; input_txt = ""
+                    with yt_lock: yt_results.clear()
+                elif k == "d":
+                    # cari ulang dengan query baru
+                    mode = "dl_input"; input_txt = ""
+                    with yt_lock: yt_results.clear()
+                elif k == KEY_UP and res:
+                    yt_sel = max(0, yt_sel - 1)
+                elif k == KEY_DOWN and res:
+                    yt_sel = min(len(res) - 1, yt_sel + 1)
+                elif k == KEY_ENTER and res and not srch:
+                    chosen = res[yt_sel]
+                    if chosen["url"] and not dl_active:
+                        start_download_url(chosen["url"], chosen["title"])
+                        mode = "normal"; input_txt = ""
+                        with yt_lock: yt_results.clear()
+                continue
+
+            # ══════════════════════════════════════════
+            #  MODE: search_input — filter real-time
+            # ══════════════════════════════════════════
+            if mode == "search_input":
+                if k == KEY_ESC:
+                    mode = "normal"; input_txt = ""
+                    pl_src = list(playlist); pl_title = "All Songs"; pl_sel_v = 0
+                elif k == KEY_ENTER:
+                    # konfirmasi, pindah fokus ke playlist
+                    mode = "normal"; active_panel = "playlist"
+                    pl_sel = pl_sel_v
+                elif k in ("\x08", "backspace"):
+                    input_txt = input_txt[:-1]
+                    pl_src = ([p for p in playlist if input_txt.lower() in p.stem.lower()]
+                              if input_txt else list(playlist))
+                    pl_title  = f"/{input_txt}" if input_txt else "All Songs"
+                    pl_sel_v  = 0
+                elif len(k) == 1 and k.isprintable():
+                    input_txt += k
+                    pl_src = [p for p in playlist if input_txt.lower() in p.stem.lower()]
+                    pl_title  = f"/{input_txt}"
+                    pl_sel_v  = 0
+                # navigasi saat search masih aktif
+                elif k == KEY_UP:
+                    pl_sel_v = max(0, pl_sel_v - 1)
+                elif k == KEY_DOWN:
+                    pl_sel_v = min(len(pl_src) - 1, pl_sel_v + 1) if pl_src else 0
+                elif k == KEY_ENTER and pl_src:
+                    try:
+                        real_idx = playlist.index(pl_src[pl_sel_v])
+                        play_song(real_idx); mode = "normal"
+                    except ValueError: pass
+                continue
+
+            # ══════════════════════════════════════════
+            #  MODE: normal — hotkey global
+            # ══════════════════════════════════════════
+            if   k in ("q",):                  stop_music(); break
+            elif k == KEY_ESC:                 stop_music(); break
             elif k == KEY_SPACE:               toggle_pause()
             elif k == "n":                     next_song()
             elif k == "p":                     prev_song()
@@ -630,31 +766,32 @@ def main_loop():
             elif k == "-":                     change_volume(-0.05)
             elif k == "r":
                 toggle_repeat()
-                # juga refresh playlist jika baru selesai download
+                # refresh playlist supaya lagu baru muncul setelah download
                 pl_src = list(playlist); pl_title = "All Songs"
             elif k == "/":
-                search_mode = True; kw = ""
-                pl_src = list(playlist); pl_title = "All Songs"; pl_sel = 0
+                mode = "search_input"; input_txt = ""
+                pl_src = list(playlist); pl_title = "All Songs"
+                pl_sel_v = pl_sel; active_panel = "playlist"
             elif k == "d":
                 if not dl_active:
-                    dl_mode = True; dl_kw = ""
+                    mode = "dl_input"; input_txt = ""
+                    with yt_lock: yt_results.clear()
             elif k == "1":                     view = "library"
             elif k == "2":                     view = "library"; active_panel = "playlist"
             elif k == "3":                     view = "karaoke"
             elif k == "k":                     view = "karaoke"
 
-            # ── Tab: switch panel ────────────────────
             elif k == KEY_TAB:
                 active_panel = "playlist" if active_panel == "library" else "library"
 
-            # ── Navigation ───────────────────────────
             elif k == KEY_UP:
                 if active_panel == "library":
                     lib_sel = (lib_sel - 1) % len(LIBRARY_ITEMS)
                     while LIBRARY_ITEMS[lib_sel][1].startswith("sep"):
                         lib_sel = (lib_sel - 1) % len(LIBRARY_ITEMS)
                 elif pl_src:
-                    pl_sel = max(0, pl_sel - 1)
+                    pl_sel_v = max(0, pl_sel_v - 1)
+                    pl_sel   = pl_sel_v
 
             elif k == KEY_DOWN:
                 if active_panel == "library":
@@ -662,26 +799,28 @@ def main_loop():
                     while LIBRARY_ITEMS[lib_sel][1].startswith("sep"):
                         lib_sel = (lib_sel + 1) % len(LIBRARY_ITEMS)
                 elif pl_src:
-                    pl_sel = min(len(pl_src) - 1, pl_sel + 1)
+                    pl_sel_v = min(len(pl_src) - 1, pl_sel_v + 1)
+                    pl_sel   = pl_sel_v
 
-            # ── Enter ────────────────────────────────
             elif k == KEY_ENTER:
                 if active_panel == "library":
                     action = LIBRARY_ITEMS[lib_sel][1]
                     if action == "search":
-                        search_mode = True; kw = ""
-                        pl_src = list(playlist); pl_title = "All Songs"; pl_sel = 0
+                        mode = "search_input"; input_txt = ""
+                        pl_src = list(playlist); pl_title = "All Songs"
+                        pl_sel_v = pl_sel; active_panel = "playlist"
                     elif action == "download":
                         if not dl_active:
-                            dl_mode = True; dl_kw = ""
+                            mode = "dl_input"; input_txt = ""
+                            with yt_lock: yt_results.clear()
                     elif action == "karaoke":
                         view = "karaoke"
                     else:
                         pl_src = list(playlist); pl_title = "All Songs"
-                        pl_sel = 0; active_panel = "playlist"
+                        pl_sel_v = 0; pl_sel = 0; active_panel = "playlist"
                 elif pl_src:
                     try:
-                        real_idx = playlist.index(pl_src[pl_sel])
+                        real_idx = playlist.index(pl_src[pl_sel_v])
                         play_song(real_idx)
                     except ValueError:
                         pass
@@ -697,12 +836,12 @@ if __name__ == "__main__":
     console.print(f"[{C_DIM}]scanning ./music ...[/{C_DIM}]")
     scan_music()
     lrc = sum(1 for p in playlist if p.with_suffix(".lrc").exists())
-    console.print(f"[{C_GREEN}]{len(playlist)} songs found[/{C_GREEN}] [{C_DIM}]({lrc} with .lrc)[/{C_DIM}]")
+    console.print(f"[{C_GREEN}]{len(playlist)} songs[/{C_GREEN}] [{C_DIM}]({lrc} .lrc)[/{C_DIM}]")
     if not HAS_LYRICS:
-        console.print(f"[{C_YELLOW}]tip: pip install syncedlyrics  for online lyrics[/{C_YELLOW}]")
+        console.print(f"[{C_YELLOW}]tip: pip install syncedlyrics[/{C_YELLOW}]")
     if not HAS_YTDLP:
-        console.print(f"[{C_YELLOW}]tip: pip install yt-dlp  for YouTube download[/{C_YELLOW}]")
-    time.sleep(0.6)
+        console.print(f"[{C_YELLOW}]tip: pip install yt-dlp  (untuk download YouTube)[/{C_YELLOW}]")
+    time.sleep(0.5)
     main_loop()
 
 # pip install pygame rich syncedlyrics mutagen yt-dlp
