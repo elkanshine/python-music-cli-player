@@ -1,6 +1,6 @@
 """
 cmus-style Music Player
-pip install pygame rich syncedlyrics mutagen yt-dlp
+pip install pygame rich syncedlyrics mutagen yt-dlp numpy sounddevice
 python app.py
 
 Kontrol:
@@ -14,7 +14,8 @@ Kontrol:
   /          = cari lagu lokal (real-time filter)
   d          = download dari YouTube (tampilkan hasil pencarian)
   k          = tampilkan lirik
-  1 2 3      = ganti tab
+  v          = audio visualizer
+  1 2 3 4    = ganti tab
   Esc        = batal / kembali
   q          = keluar
 """
@@ -45,6 +46,13 @@ try:
     import yt_dlp; HAS_YTDLP = True
 except ImportError:
     HAS_YTDLP = False
+
+try:
+    import numpy as np
+    import sounddevice as sd
+    HAS_VIZ = True
+except ImportError:
+    HAS_VIZ = False
 
 # ── palette cmus ───────────────────────────────────────
 C_GREEN   = "bright_green"
@@ -87,13 +95,25 @@ yt_results   : list[dict] = []   # [{title, duration, url, channel}, ...]
 yt_searching : bool = False
 yt_lock      = threading.Lock()
 
+# ── Audio visualizer state ─────────────────────────────
+VIZ_BARS     = 48          # jumlah bar frekuensi
+VIZ_HEIGHT   = 16          # tinggi max bar (baris)
+VIZ_RATE     = 44100
+VIZ_CHUNK    = 2048        # sampel per frame FFT
+
+viz_data     : list[float] = [0.0] * VIZ_BARS   # amplitudo per bar (0.0–1.0)
+viz_peaks    : list[float] = [0.0] * VIZ_BARS   # peak decay
+viz_lock     = threading.Lock()
+viz_stream   = None        # sounddevice InputStream
+viz_running  : bool = False
+
 LIBRARY_ITEMS = [
-    ("All Songs",  "library"),
-    ("──────────", "sep"),
-    ("Search /",   "search"),
-    ("Download d", "download"),
-    ("──────────", "sep2"),
-    ("Lyrics  k",  "karaoke"),
+    ("All Songs",      "library"),
+    ("──────────",     "sep"),
+    ("Search /",       "search"),
+    ("Download d",     "download"),
+    ("──────────",     "sep2"),
+    ("Lyrics+Viz k/v", "karaoke"),
 ]
 
 # ══════════════════════════════════════════════════════
@@ -348,14 +368,84 @@ def start_download_url(url: str, title: str):
     threading.Thread(target=_download_url_thread, args=(url, title), daemon=True).start()
 
 # ══════════════════════════════════════════════════════
+#  AUDIO VISUALIZER (sounddevice + numpy FFT)
+# ══════════════════════════════════════════════════════
+def _viz_audio_callback(indata, frames, time_info, status):
+    """Dipanggil sounddevice tiap chunk — hitung FFT lalu update viz_data."""
+    global viz_data, viz_peaks
+    if not HAS_VIZ: return
+    mono = indata[:, 0] if indata.ndim > 1 else indata.flatten()
+    # Hanning window + FFT
+    win     = np.hanning(len(mono))
+    fft_out = np.abs(np.fft.rfft(mono * win))
+    # Ambil frekuensi 20Hz–8kHz (audio yang relevan untuk musik)
+    n_fft   = len(fft_out)
+    lo      = max(1, int(20    / (VIZ_RATE / 2) * n_fft))
+    hi      = min(n_fft - 1, int(8000 / (VIZ_RATE / 2) * n_fft))
+    fft_slice = fft_out[lo:hi]
+    if len(fft_slice) < VIZ_BARS:
+        fft_slice = np.pad(fft_slice, (0, VIZ_BARS - len(fft_slice)))
+    # Bagi jadi VIZ_BARS kelompok, ambil max tiap kelompok
+    split   = np.array_split(fft_slice, VIZ_BARS)
+    amps    = np.array([g.max() if len(g) else 0 for g in split], dtype=float)
+    # Normalisasi log
+    amps    = np.log1p(amps)
+    mx      = amps.max()
+    if mx > 0: amps = amps / mx
+    # Smoothing dengan nilai sebelumnya (rise cepat, fall lambat)
+    with viz_lock:
+        for i in range(VIZ_BARS):
+            if amps[i] > viz_data[i]:
+                viz_data[i] = amps[i] * 0.8 + viz_data[i] * 0.2   # rise cepat
+            else:
+                viz_data[i] = viz_data[i] * 0.75                    # fall lambat
+            # peak decay
+            if amps[i] >= viz_peaks[i]:
+                viz_peaks[i] = amps[i]
+            else:
+                viz_peaks[i] = max(0.0, viz_peaks[i] - 0.03)
+
+def start_visualizer():
+    global viz_stream, viz_running, viz_data, viz_peaks
+    if not HAS_VIZ: return
+    if viz_running: return
+    try:
+        with viz_lock:
+            viz_data  = [0.0] * VIZ_BARS
+            viz_peaks = [0.0] * VIZ_BARS
+        viz_stream = sd.InputStream(
+            samplerate=VIZ_RATE,
+            channels=1,
+            blocksize=VIZ_CHUNK,
+            callback=_viz_audio_callback,
+        )
+        viz_stream.start()
+        viz_running = True
+    except Exception:
+        viz_running = False
+
+def stop_visualizer():
+    global viz_stream, viz_running
+    if viz_stream:
+        try:
+            viz_stream.stop()
+            viz_stream.close()
+        except Exception: pass
+        viz_stream  = None
+    viz_running = False
+
+# ══════════════════════════════════════════════════════
 #  RENDER COMPONENTS
 # ══════════════════════════════════════════════════════
 def fmt_time(sec: float) -> str:
     m, s = divmod(int(max(sec, 0)), 60)
     return f"{m}:{s:02d}"
 
-def progress_bar(width: int = 40) -> str:
-    if not playlist: return f"[{C_DIM}]{'─'*width}[/{C_DIM}]"
+def progress_bar(width: int = 40) -> Text:
+    t = Text(no_wrap=True)
+    if not playlist:
+        t.append("─" * width, style=C_DIM)
+        return t
     pos = max(pygame.mixer.music.get_pos()/1000, 0)
     dur = 0
     if HAS_MUTAGEN:
@@ -364,19 +454,30 @@ def progress_bar(width: int = 40) -> str:
     frac  = (pos / dur) if dur > 0 else 0
     done  = round(frac * width)
     empty = width - done
-    bar   = "━" * done + ("╸" if empty else "") + "─" * max(0, empty - 1)
-    return f"[{C_GREEN}]{bar[:done+1]}[/{C_GREEN}][{C_DIM}]{bar[done+1:]}[/{C_DIM}]"
+    if done > 0:
+        t.append("━" * done, style=C_GREEN)
+    if empty > 0:
+        t.append("╸", style=C_GREEN)
+        t.append("─" * max(0, empty - 1), style=C_DIM)
+    return t
 
-def vol_bar(width: int = 8) -> str:
+def vol_bar(width: int = 8) -> Text:
     filled = round(volume * width)
-    return (f"[{C_GREEN}]" + "█" * filled + f"[/{C_GREEN}]"
-            + f"[{C_DIM}]" + "░" * (width - filled) + f"[/{C_DIM}]")
+    t = Text(no_wrap=True)
+    t.append("█" * filled,          style=C_GREEN)
+    t.append("░" * (width - filled), style=C_DIM)
+    return t
 
 def make_tab_bar(view: str) -> Text:
-    tabs = [("1:library", "library"), ("2:playlist", "playlist"), ("3:lyrics", "karaoke")]
+    tabs = [
+        ("1:library",   "library"),
+        ("2:playlist",  "playlist"),
+        ("3:lyrics+viz","karaoke"),
+    ]
     t = Text()
     for label, key in tabs:
-        if view == key:
+        active = (view == key) or (view == "viz" and key == "karaoke")
+        if active:
             t.append(f" {label} ", style=f"bold {C_GREEN} on grey19")
         else:
             t.append(f" {label} ", style=C_DIM)
@@ -450,7 +551,7 @@ def make_status_bar(mode: str = "normal", input_text: str = "") -> Text:
 FOOTER_NORMAL = (
     "Tab:panel", "↑↓:nav", "Enter:play", "spc:pause",
     "n/p:skip",  "+/-:vol", "r:repeat",
-    "/:cari",    "d:download", "k:lirik", "q:quit",
+    "/:cari",    "d:download", "k/v:lyrics+viz", "q:quit",
 )
 FOOTER_SEARCH = (
     "ketik:filter real-time", "Enter:konfirmasi", "Esc:batal",
@@ -557,30 +658,226 @@ def make_yt_panel(results: list[dict], sel: int, searching: bool) -> Panel:
                  border_style=C_YELLOW, box=box.SIMPLE_HEAVY, padding=(0,0))
 
 # ── Lyrics pane ────────────────────────────────────────
-CONTEXT = 5
+CONTEXT = 3   # dikurangi dari 5 karena berbagi ruang dengan viz
+
+def _render_lyrics_rows(height: int) -> Text:
+    """Render baris lirik saja (tanpa panel), maks `height` baris."""
+    with lyrics_lock: lines = list(lyrics_lines)
+    t = Text(justify="center", no_wrap=True)
+    if not lines:
+        if HAS_LYRICS:
+            t.append("  ♪  memuat lirik...\n", style=C_DIM)
+        else:
+            t.append("  ♪  (pip install syncedlyrics)\n", style=C_DIM)
+        return t
+    idx   = current_lyric_idx()
+    if idx < 0: idx = 0
+    half  = max(1, (height - 1) // 2)
+    start = max(0, idx - half)
+    end   = min(len(lines), start + height)
+    # geser start jika end mentok
+    if end - start < height:
+        start = max(0, end - height)
+    for i in range(start, end):
+        _, text = lines[i]
+        dist = abs(i - idx)
+        txt  = text[:80]
+        if i == idx:    t.append(f"  ♫  {txt}  ♫\n", style=f"bold {C_WHITE} on grey19")
+        elif dist == 1: t.append(f"     {txt}\n",     style=C_WHITE)
+        elif dist == 2: t.append(f"     {txt}\n",     style=C_GREEN)
+        else:           t.append(f"     {txt}\n",     style=C_DIM)
+    return t
+
+def _render_viz_rows(panel_w: int, bar_h: int) -> Text:
+    """Render baris bar visualizer saja (tanpa panel/label)."""
+    with viz_lock:
+        amps  = list(viz_data)
+        peaks = list(viz_peaks)
+
+    bar_w = 2
+    n     = min(VIZ_BARS, panel_w // bar_w)
+
+    t = Text(no_wrap=True)
+
+    if not HAS_VIZ or not viz_running:
+        for _ in range(bar_h):
+            t.append("\n")
+        return t
+
+    cols_data = []
+    for i in range(n):
+        src_i = int(i * VIZ_BARS / n)
+        amp   = min(0.95, amps[src_i])
+        pk    = min(0.99, peaks[src_i])
+        cols_data.append(_amp_to_blocks(amp, pk, bar_h))
+
+    for row in range(bar_h - 1, -1, -1):
+        t.append(" ")
+        for i, col in enumerate(cols_data):
+            ch  = col[row]
+            clr = _bar_color(i, n)
+            if ch == "─":
+                t.append(ch + " ", style=C_WHITE)
+            elif ch != " ":
+                t.append(ch + " ", style=f"bold {clr}")
+            else:
+                t.append("  ")
+        t.append("\n")
+
+    # freq label
+    freq_map = [("20Hz",0.00),("250Hz",0.10),("1kHz",0.35),("4kHz",0.65),("8kHz",0.92)]
+    label_line = [" "] * (n * bar_w + 1)
+    for lbl, ratio in freq_map:
+        pos = 1 + int(ratio * n) * bar_w
+        for j, ch in enumerate(lbl):
+            if pos + j < len(label_line):
+                label_line[pos + j] = ch
+    t.append("".join(label_line), style=C_DIM)
+    t.append("\n")
+    return t
+
+def make_lyric_viz_panel(total_height: int) -> Panel:
+    """Panel gabungan: visualizer (atas) + lirik (bawah)."""
+    song_name = playlist[current_index].stem if playlist else ""
+    title_str = (f"[{C_TITLE}]Lyrics + Viz[/{C_TITLE}]"
+                 + (f"  [{C_DIM}]{song_name[:45]}[/{C_DIM}]" if song_name else ""))
+
+    # Bagi tinggi: viz ~55%, lirik ~45%
+    inner_h  = max(6, total_height - 2)   # kurangi border atas/bawah
+    viz_h    = max(3, int(inner_h * 0.55))
+    lyr_h    = max(2, inner_h - viz_h - 1)  # -1 untuk garis pemisah
+
+    term_w  = console.width or 80
+    panel_w = max(20, term_w - 24)
+
+    t = Text(no_wrap=True)
+
+    # ── Bagian visualizer ──
+    if HAS_VIZ and viz_running:
+        t.append_text(_render_viz_rows(panel_w, viz_h))
+    else:
+        # placeholder jika viz tidak aktif
+        hint = "tekan v untuk aktifkan visualizer" if HAS_VIZ else "pip install numpy sounddevice"
+        for _ in range(viz_h // 2):
+            t.append("\n")
+        t.append(f"  {hint}\n", style=C_DIM)
+        for _ in range(viz_h - viz_h // 2 - 1):
+            t.append("\n")
+
+    # ── Garis pemisah ──
+    sep_w = min(panel_w, term_w - 4)
+    t.append(" " + "─" * sep_w + "\n", style=C_DIM)
+
+    # ── Bagian lirik ──
+    t.append_text(_render_lyrics_rows(lyr_h))
+
+    return Panel(t, title=title_str, border_style=C_GREEN, box=box.SIMPLE_HEAVY)
 
 def make_lyric_panel() -> Panel:
-    with lyrics_lock: lines = list(lyrics_lines)
-    t = Text(justify="center")
-    if not lines:
-        msg = "♪  memuat lirik..." if HAS_LYRICS else "♪  (pip install syncedlyrics)"
-        t.append(f"\n\n{msg}\n", style=C_DIM)
-    else:
-        idx   = current_lyric_idx()
-        if idx < 0: idx = 0
-        start = max(0, idx - CONTEXT)
-        end   = min(len(lines), idx + CONTEXT + 1)
+    """Lyric-only panel (tab 3 sekarang diarahkan ke gabungan)."""
+    return make_lyric_viz_panel(total_height=20)
+
+# ── Visualizer pane ────────────────────────────────────
+# Blok Unicode dari bawah ke atas: 1/8 … 8/8
+_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+# Palet warna per ketinggian (bass=hijau, mid=cyan, treble=kuning)
+def _bar_color(bar_idx: int, total: int) -> str:
+    ratio = bar_idx / max(total - 1, 1)
+    if ratio < 0.35:   return C_GREEN          # bass
+    elif ratio < 0.65: return "bright_cyan"    # mid
+    else:              return C_YELLOW         # treble
+
+def _amp_to_blocks(amp: float, peak: float, height: int) -> list[str]:
+    """Konversi amplitudo (0–1) ke kolom karakter tinggi `height` baris."""
+    filled_f = amp * height          # misal 3.6 dari 16
+    filled_i = int(filled_f)         # baris penuh = 3
+    frac     = filled_f - filled_i  # sisa = 0.6
+    col      = []
+    for row in range(height):
+        if row < filled_i:
+            col.append("█")
+        elif row == filled_i:
+            idx = min(8, max(0, round(frac * 8)))
+            col.append(_BLOCKS[idx])
+        else:
+            col.append(" ")
+    # peak dot
+    peak_row = min(height - 1, int(peak * height))
+    if peak_row > filled_i and col[peak_row] == " ":
+        col[peak_row] = "─"
+    return col   # col[0]=bawah, col[height-1]=atas
+
+def make_viz_panel(height: int = 16) -> Panel:
+    with viz_lock:
+        amps  = list(viz_data)
+        peaks = list(viz_peaks)
+
+    song_name = playlist[current_index].stem if playlist else ""
+    title_str = (f"[{C_TITLE}]Visualizer[/{C_TITLE}]"
+                 + (f" [{C_DIM}]— {song_name[:50]}[/{C_DIM}]" if song_name else ""))
+
+    if not HAS_VIZ:
+        t = Text(justify="center")
+        t.append("\n\n  pip install numpy sounddevice\n  untuk mengaktifkan visualizer\n",
+                 style=C_DIM)
+        return Panel(t, title=title_str, border_style=C_GREEN, box=box.SIMPLE_HEAVY)
+
+    if not playlist or (not viz_running and not any(a > 0.01 for a in amps)):
+        t = Text(justify="center")
+        t.append("\n\n  tekan v untuk aktifkan / nonaktifkan visualizer\n", style=C_DIM)
+        return Panel(t, title=title_str, border_style=C_GREEN, box=box.SIMPLE_HEAVY)
+
+    # Hitung lebar panel aktual: terminal - sidebar(20) - border(4)
+    term_w  = console.width or 80
+    panel_w = max(20, term_w - 24)        # lebar konten panel kanan
+    bar_w   = 2                            # setiap bar = 2 karakter lebar
+    n       = min(VIZ_BARS, panel_w // bar_w)  # sesuaikan jumlah bar
+    bar_h   = max(4, height - 4)           # cap tinggi, sisakan 1 baris label
+
+    # Bangun kolom per bar
+    cols_data = []
+    for i in range(n):
+        # Ambil amplitudo bar ke-i (proporsional dari VIZ_BARS)
+        src_i = int(i * VIZ_BARS / n)
+        amp   = min(0.95, amps[src_i])    # cap 95% agar tidak menyentuh batas atas
+        pk    = min(0.99, peaks[src_i])
+        cols_data.append(_amp_to_blocks(amp, pk, bar_h))
+
+    # Render baris demi baris dari atas ke bawah
+    t = Text(no_wrap=True)
+    for row in range(bar_h - 1, -1, -1):
+        t.append(" ")   # margin kiri 1 karakter
+        for i, col in enumerate(cols_data):
+            ch  = col[row]
+            clr = _bar_color(i, n)
+            ch2 = ch + " "   # setiap bar 2 karakter: blok + spasi
+            if ch == "─":
+                t.append(ch2, style=f"{C_WHITE}")
+            elif ch != " ":
+                t.append(ch2, style=f"bold {clr}")
+            else:
+                t.append("  ")   # 2 spasi kosong
         t.append("\n")
-        for i in range(start, end):
-            _, text = lines[i]
-            dist = abs(i - idx)
-            if i == idx:    t.append(f"  ♫  {text}  ♫\n", style=f"bold {C_WHITE} on grey19")
-            elif dist == 1: t.append(f"     {text}\n",     style=C_WHITE)
-            elif dist == 2: t.append(f"     {text}\n",     style=C_GREEN)
-            else:           t.append(f"     {text}\n",     style=C_DIM)
-    return Panel(Align.center(t, vertical="middle"),
-                 title=f"[{C_TITLE}]Lyrics[/{C_TITLE}]",
-                 border_style=C_GREEN, box=box.SIMPLE_HEAVY)
+
+    # Label frekuensi — sesuaikan posisi dengan bar_w=2
+    freq_map = [
+        ("20Hz",  0.00),
+        ("250Hz", 0.10),
+        ("1kHz",  0.35),
+        ("4kHz",  0.65),
+        ("8kHz",  0.92),
+    ]
+    label_line = [" "] * (n * bar_w + 1)
+    for lbl, ratio in freq_map:
+        pos = 1 + int(ratio * n) * bar_w   # +1 untuk margin kiri
+        for j, ch in enumerate(lbl):
+            if pos + j < len(label_line):
+                label_line[pos + j] = ch
+    t.append("".join(label_line), style=C_DIM)
+    t.append("\n")
+
+    return Panel(t, title=title_str, border_style=C_GREEN, box=box.SIMPLE_HEAVY)
 
 # ── Full layout ────────────────────────────────────────
 def build_layout(view: str,
@@ -599,11 +896,12 @@ def build_layout(view: str,
 
     root["tabs"].update(make_tab_bar(view))
 
-    pb = Text()
+    pb = Text(no_wrap=True)
     pb.append("  ")
-    pb.append(progress_bar(console.width - 20 if console.width else 60))
+    pb_width = max(20, (console.width or 80) - 22)
+    pb.append_text(progress_bar(pb_width))
     pb.append("  ")
-    pb.append(vol_bar())
+    pb.append_text(vol_bar())
     root["progbar"].update(pb)
 
     body   = Layout()
@@ -616,10 +914,9 @@ def build_layout(view: str,
     body["lib"].update(make_library_panel(focused=(active_panel == "library")))
 
     if mode in ("dl_input", "dl_results"):
-        # panel kanan: YouTube results
         body["main"].update(make_yt_panel(yt_res, yt_sel, yt_srch))
-    elif view == "karaoke":
-        body["main"].update(make_lyric_panel())
+    elif view in ("karaoke", "viz"):
+        body["main"].update(make_lyric_viz_panel(total_height=body_h))
     else:
         body["main"].update(
             make_playlist_panel(pl_src, pl_title,
@@ -660,7 +957,7 @@ def main_loop():
     def _get_yt():
         with yt_lock: return list(yt_results), yt_searching
 
-    with Live(console=console, refresh_per_second=8, screen=True) as live:
+    with Live(console=console, refresh_per_second=20, screen=True) as live:
         while True:
             check_song_end()
             try:    rows = os.get_terminal_size().lines
@@ -673,7 +970,7 @@ def main_loop():
             ))
 
             if not msvcrt.kbhit():
-                time.sleep(0.06)
+                time.sleep(0.04 if view == "viz" else 0.06)
                 continue
 
             k = read_key()
@@ -776,10 +1073,16 @@ def main_loop():
                 if not dl_active:
                     mode = "dl_input"; input_txt = ""
                     with yt_lock: yt_results.clear()
-            elif k == "1":                     view = "library"
-            elif k == "2":                     view = "library"; active_panel = "playlist"
-            elif k == "3":                     view = "karaoke"
-            elif k == "k":                     view = "karaoke"
+            elif k == "1":    view = "library"
+            elif k == "2":    view = "library"; active_panel = "playlist"
+            elif k == "3":    view = "karaoke"; start_visualizer()
+            elif k in ("k", "v"):
+                if view == "karaoke":
+                    # toggle visualizer on/off saat sudah di tab ini
+                    if viz_running: stop_visualizer()
+                    else:           start_visualizer()
+                else:
+                    view = "karaoke"; start_visualizer()
 
             elif k == KEY_TAB:
                 active_panel = "playlist" if active_panel == "library" else "library"
@@ -814,7 +1117,9 @@ def main_loop():
                             mode = "dl_input"; input_txt = ""
                             with yt_lock: yt_results.clear()
                     elif action == "karaoke":
-                        view = "karaoke"
+                        view = "karaoke"; start_visualizer()
+                    elif action == "viz":
+                        view = "karaoke"; start_visualizer()
                     else:
                         pl_src = list(playlist); pl_title = "All Songs"
                         pl_sel_v = 0; pl_sel = 0; active_panel = "playlist"
@@ -825,6 +1130,7 @@ def main_loop():
                     except ValueError:
                         pass
 
+    stop_visualizer()
     os.system("cls")
     console.print(f"\n[{C_DIM}]bye ♪[/{C_DIM}]\n")
 
@@ -841,7 +1147,9 @@ if __name__ == "__main__":
         console.print(f"[{C_YELLOW}]tip: pip install syncedlyrics[/{C_YELLOW}]")
     if not HAS_YTDLP:
         console.print(f"[{C_YELLOW}]tip: pip install yt-dlp  (untuk download YouTube)[/{C_YELLOW}]")
+    if not HAS_VIZ:
+        console.print(f"[{C_YELLOW}]tip: pip install numpy sounddevice  (untuk visualizer)[/{C_YELLOW}]")
     time.sleep(0.5)
     main_loop()
 
-# pip install pygame rich syncedlyrics mutagen yt-dlp
+# pip install pygame rich syncedlyrics mutagen yt-dlp numpy sounddevice
