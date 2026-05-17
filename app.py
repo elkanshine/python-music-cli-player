@@ -1,7 +1,6 @@
 """
-cmus-style Music Player
-pip install pygame rich syncedlyrics mutagen yt-dlp numpy sounddevice
-python app.py
+cmus-style Music Player — dengan fitur Playlist Management
+pip install pygame rich syncedlyrics mutagen yt-dlp numpy pydub
 
 Kontrol:
   Tab        = pindah panel (Library <-> Playlist)
@@ -15,12 +14,16 @@ Kontrol:
   d          = download dari YouTube (tampilkan hasil pencarian)
   k          = tampilkan lirik
   v          = audio visualizer
+  a          = add lagu ke playlist kustom
+  x          = hapus lagu dari playlist kustom
+  N          = buat playlist baru
+  D          = hapus playlist kustom
   1 2 3 4    = ganti tab
   Esc        = batal / kembali
   q          = keluar
 """
 
-import os, re, sys, time, threading, msvcrt
+import os, re, sys, time, threading, json, msvcrt
 from pathlib import Path
 
 import pygame
@@ -49,10 +52,17 @@ except ImportError:
 
 try:
     import numpy as np
-    import sounddevice as sd
-    HAS_VIZ = True
+    HAS_NUMPY = True
 except ImportError:
-    HAS_VIZ = False
+    HAS_NUMPY = False
+
+try:
+    from pydub import AudioSegment
+    HAS_PYDUB = True
+except ImportError:
+    HAS_PYDUB = False
+
+HAS_VIZ = HAS_NUMPY and HAS_PYDUB
 
 # ── palette cmus ───────────────────────────────────────
 C_GREEN   = "bright_green"
@@ -60,13 +70,102 @@ C_WHITE   = "white"
 C_DIM     = "grey46"
 C_YELLOW  = "yellow"
 C_RED     = "bright_red"
+C_CYAN    = "bright_cyan"
+C_MAGENTA = "bright_magenta"
 C_SEL_BG  = "on grey15"
 C_TITLE   = "bold bright_green"
 C_BORDER  = "grey30"
 
-MUSIC_FOLDER = Path("./music")
-console      = Console()
+MUSIC_FOLDER    = Path("./music")
+PLAYLIST_FILE   = Path("./playlists.json")
+console         = Console()
 pygame.mixer.init()
+
+# ══════════════════════════════════════════════════════
+#  CUSTOM PLAYLIST MANAGEMENT
+# ══════════════════════════════════════════════════════
+# Format: {"playlist_name": ["song_stem1", "song_stem2", ...]}
+custom_playlists: dict[str, list[str]] = {}
+pl_lock = threading.Lock()
+
+def load_playlists():
+    global custom_playlists
+    if PLAYLIST_FILE.exists():
+        try:
+            with open(PLAYLIST_FILE, "r", encoding="utf-8") as f:
+                custom_playlists = json.load(f)
+        except Exception:
+            custom_playlists = {}
+    else:
+        custom_playlists = {}
+
+def save_playlists():
+    with pl_lock:
+        try:
+            with open(PLAYLIST_FILE, "w", encoding="utf-8") as f:
+                json.dump(custom_playlists, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+def create_playlist(name: str) -> bool:
+    """Buat playlist baru. Return False jika sudah ada."""
+    name = name.strip()
+    if not name:
+        return False
+    with pl_lock:
+        if name in custom_playlists:
+            return False
+        custom_playlists[name] = []
+    save_playlists()
+    return True
+
+def delete_playlist(name: str) -> bool:
+    """Hapus playlist kustom. Return False jika tidak ada."""
+    with pl_lock:
+        if name not in custom_playlists:
+            return False
+        del custom_playlists[name]
+    save_playlists()
+    return True
+
+def add_song_to_playlist(pl_name: str, song_path: Path) -> bool:
+    """Tambah lagu ke playlist. Return False jika sudah ada."""
+    stem = song_path.stem
+    with pl_lock:
+        if pl_name not in custom_playlists:
+            return False
+        if stem in custom_playlists[pl_name]:
+            return False
+        custom_playlists[pl_name].append(stem)
+    save_playlists()
+    return True
+
+def remove_song_from_playlist(pl_name: str, song_path: Path) -> bool:
+    """Hapus lagu dari playlist. Return False jika tidak ada."""
+    stem = song_path.stem
+    with pl_lock:
+        if pl_name not in custom_playlists:
+            return False
+        if stem not in custom_playlists[pl_name]:
+            return False
+        custom_playlists[pl_name].remove(stem)
+    save_playlists()
+    return True
+
+def get_playlist_songs(pl_name: str) -> list[Path]:
+    """Ambil daftar Path lagu dari playlist kustom."""
+    with pl_lock:
+        stems = list(custom_playlists.get(pl_name, []))
+    result = []
+    for stem in stems:
+        p = MUSIC_FOLDER / f"{stem}.mp3"
+        if p.exists():
+            result.append(p)
+    return result
+
+def get_playlist_names() -> list[str]:
+    with pl_lock:
+        return list(custom_playlists.keys())
 
 # ── state ──────────────────────────────────────────────
 playlist      : list[Path]             = []
@@ -85,36 +184,66 @@ active_panel : str = "playlist"
 lib_sel      : int = 0
 pl_sel       : int = 0
 
+# ── feedback message ────────────────────────────────────
+feedback_msg  : str = ""
+feedback_time : float = 0.0
+FEEDBACK_DURATION = 2.5
+
+def set_feedback(msg: str):
+    global feedback_msg, feedback_time
+    feedback_msg  = msg
+    feedback_time = time.time()
+
+def get_feedback() -> str:
+    global feedback_msg
+    if feedback_msg and (time.time() - feedback_time) > FEEDBACK_DURATION:
+        feedback_msg = ""
+    return feedback_msg
+
 # ── download state ─────────────────────────────────────
 dl_status    : str  = ""
 dl_active    : bool = False
 dl_lock      = threading.Lock()
 
 # ── YouTube search results state ───────────────────────
-yt_results   : list[dict] = []   # [{title, duration, url, channel}, ...]
+yt_results   : list[dict] = []
 yt_searching : bool = False
 yt_lock      = threading.Lock()
 
 # ── Audio visualizer state ─────────────────────────────
-VIZ_BARS     = 48          # jumlah bar frekuensi
-VIZ_HEIGHT   = 16          # tinggi max bar (baris)
-VIZ_RATE     = 44100
-VIZ_CHUNK    = 2048        # sampel per frame FFT
+VIZ_BARS    = 48
+VIZ_HEIGHT  = 16
+VIZ_CHUNK   = 4096
 
-viz_data     : list[float] = [0.0] * VIZ_BARS   # amplitudo per bar (0.0–1.0)
-viz_peaks    : list[float] = [0.0] * VIZ_BARS   # peak decay
-viz_lock     = threading.Lock()
-viz_stream   = None        # sounddevice InputStream
-viz_running  : bool = False
+viz_data    : list[float] = [0.0] * VIZ_BARS
+viz_peaks   : list[float] = [0.0] * VIZ_BARS
+viz_lock    = threading.Lock()
+viz_running : bool = False
+viz_stop_ev = threading.Event()
+viz_thread  = None
 
-LIBRARY_ITEMS = [
-    ("All Songs",      "library"),
-    ("──────────",     "sep"),
-    ("Search /",       "search"),
-    ("Download d",     "download"),
-    ("──────────",     "sep2"),
-    ("Lyrics+Viz k/v", "karaoke"),
-]
+_viz_cache_path : str = ""
+_viz_samples    = None
+_viz_sr         : int = 44100
+
+# ── Library items (dinamis) ────────────────────────────
+def build_library_items() -> list[tuple[str, str]]:
+    items = [
+        ("All Songs",      "library"),
+        ("──────────",     "sep"),
+        ("Search /",       "search"),
+        ("Download d",     "download"),
+        ("──────────",     "sep2"),
+        ("Lyrics+Viz k/v", "karaoke"),
+        ("──────────",     "sep3"),
+        ("+ New Playlist N","new_playlist"),
+    ]
+    names = get_playlist_names()
+    for name in names:
+        cnt = len(custom_playlists.get(name, []))
+        label = f"♫ {name[:16]} ({cnt})"
+        items.append((label, f"pl:{name}"))
+    return items
 
 # ══════════════════════════════════════════════════════
 #  INPUT
@@ -290,7 +419,6 @@ def _dl_progress_hook(d: dict):
             dl_status = "ERROR saat download"
 
 def _yt_search_thread(query: str):
-    """Cari 7 hasil di YouTube tanpa download."""
     global yt_results, yt_searching
     if not HAS_YTDLP:
         with yt_lock:
@@ -368,71 +496,97 @@ def start_download_url(url: str, title: str):
     threading.Thread(target=_download_url_thread, args=(url, title), daemon=True).start()
 
 # ══════════════════════════════════════════════════════
-#  AUDIO VISUALIZER (sounddevice + numpy FFT)
+#  AUDIO VISUALIZER
 # ══════════════════════════════════════════════════════
-def _viz_audio_callback(indata, frames, time_info, status):
-    """Dipanggil sounddevice tiap chunk — hitung FFT lalu update viz_data."""
-    global viz_data, viz_peaks
-    if not HAS_VIZ: return
-    mono = indata[:, 0] if indata.ndim > 1 else indata.flatten()
-    # Hanning window + FFT
-    win     = np.hanning(len(mono))
-    fft_out = np.abs(np.fft.rfft(mono * win))
-    # Ambil frekuensi 20Hz–8kHz (audio yang relevan untuk musik)
+def _load_audio_samples(path: Path):
+    global _viz_cache_path, _viz_samples, _viz_sr
+    p = str(path)
+    if p == _viz_cache_path and _viz_samples is not None:
+        return _viz_samples, _viz_sr
+    try:
+        seg = AudioSegment.from_file(p)
+        seg = seg.set_channels(1).set_frame_rate(44100)
+        raw = np.array(seg.get_array_of_samples(), dtype=np.float32)
+        mx  = np.abs(raw).max()
+        if mx > 0: raw /= mx
+        _viz_cache_path = p
+        _viz_samples    = raw
+        _viz_sr         = 44100
+        return raw, 44100
+    except Exception:
+        _viz_cache_path = ""
+        _viz_samples    = None
+        return None, 44100
+
+def _fft_frame(samples, sr: int, pos_sec: float) -> list:
+    start = int(pos_sec * sr)
+    chunk = samples[start : start + VIZ_CHUNK]
+    if len(chunk) < VIZ_CHUNK:
+        chunk = np.pad(chunk, (0, VIZ_CHUNK - len(chunk)))
+    win     = np.hanning(len(chunk))
+    fft_out = np.abs(np.fft.rfft(chunk * win))
     n_fft   = len(fft_out)
-    lo      = max(1, int(20    / (VIZ_RATE / 2) * n_fft))
-    hi      = min(n_fft - 1, int(8000 / (VIZ_RATE / 2) * n_fft))
-    fft_slice = fft_out[lo:hi]
-    if len(fft_slice) < VIZ_BARS:
-        fft_slice = np.pad(fft_slice, (0, VIZ_BARS - len(fft_slice)))
-    # Bagi jadi VIZ_BARS kelompok, ambil max tiap kelompok
-    split   = np.array_split(fft_slice, VIZ_BARS)
-    amps    = np.array([g.max() if len(g) else 0 for g in split], dtype=float)
-    # Normalisasi log
-    amps    = np.log1p(amps)
-    mx      = amps.max()
-    if mx > 0: amps = amps / mx
-    # Smoothing dengan nilai sebelumnya (rise cepat, fall lambat)
-    with viz_lock:
-        for i in range(VIZ_BARS):
-            if amps[i] > viz_data[i]:
-                viz_data[i] = amps[i] * 0.8 + viz_data[i] * 0.2   # rise cepat
-            else:
-                viz_data[i] = viz_data[i] * 0.75                    # fall lambat
-            # peak decay
-            if amps[i] >= viz_peaks[i]:
-                viz_peaks[i] = amps[i]
-            else:
-                viz_peaks[i] = max(0.0, viz_peaks[i] - 0.03)
+    lo_bin = max(1, int(20    / (sr / 2) * n_fft))
+    hi_bin = min(n_fft - 1, int(16000 / (sr / 2) * n_fft))
+    bins   = np.logspace(np.log10(lo_bin), np.log10(hi_bin), VIZ_BARS + 1, dtype=int)
+    amps   = np.zeros(VIZ_BARS)
+    for i in range(VIZ_BARS):
+        b0, b1 = bins[i], max(bins[i] + 1, bins[i + 1])
+        amps[i] = fft_out[b0 : min(b1, n_fft)].mean()
+    amps = np.log1p(amps * 10)
+    mx   = amps.max()
+    if mx > 0: amps /= mx
+    return amps.tolist()
+
+def _viz_worker():
+    global viz_running
+    prev_path = ""
+    samples   = None
+    sr        = 44100
+    while not viz_stop_ev.is_set():
+        if not playlist or paused:
+            time.sleep(0.04); continue
+        cur_path = str(playlist[current_index])
+        if cur_path != prev_path:
+            samples, sr = _load_audio_samples(playlist[current_index])
+            prev_path   = cur_path
+        if samples is None:
+            time.sleep(0.04); continue
+        pos_ms = pygame.mixer.music.get_pos()
+        if pos_ms < 0:
+            time.sleep(0.04); continue
+        pos_sec  = pos_ms / 1000.0
+        new_amps = _fft_frame(samples, sr, pos_sec)
+        with viz_lock:
+            for i in range(VIZ_BARS):
+                a = new_amps[i]
+                if a > viz_data[i]:
+                    viz_data[i] = a * 0.65 + viz_data[i] * 0.35
+                else:
+                    viz_data[i] = viz_data[i] * 0.82
+                if a >= viz_peaks[i]:
+                    viz_peaks[i] = a
+                else:
+                    viz_peaks[i] = max(0.0, viz_peaks[i] - 0.022)
+        time.sleep(0.04)
 
 def start_visualizer():
-    global viz_stream, viz_running, viz_data, viz_peaks
+    global viz_running, viz_thread
     if not HAS_VIZ: return
     if viz_running: return
-    try:
-        with viz_lock:
-            viz_data  = [0.0] * VIZ_BARS
-            viz_peaks = [0.0] * VIZ_BARS
-        viz_stream = sd.InputStream(
-            samplerate=VIZ_RATE,
-            channels=1,
-            blocksize=VIZ_CHUNK,
-            callback=_viz_audio_callback,
-        )
-        viz_stream.start()
-        viz_running = True
-    except Exception:
-        viz_running = False
+    viz_stop_ev.clear()
+    with viz_lock:
+        viz_data[:]  = [0.0] * VIZ_BARS
+        viz_peaks[:] = [0.0] * VIZ_BARS
+    viz_thread = threading.Thread(target=_viz_worker, daemon=True)
+    viz_thread.start()
+    viz_running = True
 
 def stop_visualizer():
-    global viz_stream, viz_running
-    if viz_stream:
-        try:
-            viz_stream.stop()
-            viz_stream.close()
-        except Exception: pass
-        viz_stream  = None
+    global viz_running, viz_thread
+    viz_stop_ev.set()
     viz_running = False
+    viz_thread  = None
 
 # ══════════════════════════════════════════════════════
 #  RENDER COMPONENTS
@@ -476,7 +630,8 @@ def make_tab_bar(view: str) -> Text:
     ]
     t = Text()
     for label, key in tabs:
-        active = (view == key) or (view == "viz" and key == "karaoke")
+        active = (view == key) or (view == "viz" and key == "karaoke") or \
+                 (view.startswith("pl:") and key == "playlist")
         if active:
             t.append(f" {label} ", style=f"bold {C_GREEN} on grey19")
         else:
@@ -485,8 +640,8 @@ def make_tab_bar(view: str) -> Text:
     return t
 
 # ── Status bar ─────────────────────────────────────────
-def make_status_bar(mode: str = "normal", input_text: str = "") -> Text:
-    # mode: normal | search_input | dl_input | dl_results | dl_progress
+def make_status_bar(mode: str = "normal", input_text: str = "",
+                    ctx_pl: str = "") -> Text:
     if mode == "search_input":
         t = Text()
         t.append(" / ", style=f"bold {C_GREEN}")
@@ -513,6 +668,38 @@ def make_status_bar(mode: str = "normal", input_text: str = "") -> Text:
         t.append(":batal", style=C_DIM)
         return t
 
+    if mode == "new_playlist":
+        t = Text()
+        t.append(" N ", style=f"bold {C_CYAN}")
+        t.append("nama playlist baru: ", style=C_DIM)
+        t.append(input_text, style=C_WHITE)
+        t.append("█", style=C_CYAN)
+        return t
+
+    if mode == "add_to_playlist":
+        t = Text()
+        t.append(" a ", style=f"bold {C_MAGENTA}")
+        t.append("pilih playlist → ", style=C_DIM)
+        t.append(input_text or "(tekan ↑↓ lalu Enter)", style=C_WHITE)
+        return t
+
+    if mode == "confirm_delete_pl":
+        t = Text()
+        t.append(" D ", style=f"bold {C_RED}")
+        t.append(f"hapus playlist '{ctx_pl}'? ", style=C_DIM)
+        t.append("Enter", style=f"bold {C_RED}")
+        t.append(":ya  ", style=C_DIM)
+        t.append("Esc", style=f"bold {C_GREEN}")
+        t.append(":batal", style=C_DIM)
+        return t
+
+    # feedback message (temporary)
+    fb = get_feedback()
+    if fb:
+        t = Text(no_wrap=True)
+        t.append(f" ✓ {fb}", style=f"bold {C_CYAN}")
+        return t
+
     # download progress
     with dl_lock:
         dls      = dl_status
@@ -537,7 +724,7 @@ def make_status_bar(mode: str = "normal", input_text: str = "") -> Text:
     icon       = "|| " if paused else ">> "
     icon_style = C_YELLOW if paused else C_GREEN
     t.append(f" {icon}", style=f"bold {icon_style}")
-    t.append(song[:55], style=f"bold {C_WHITE}")
+    t.append(song[:50], style=f"bold {C_WHITE}")
     t.append(f"  {fmt_time(pos_s)}", style=C_GREEN)
     if dur: t.append(f"/{fmt_time(dur)}", style=C_DIM)
     t.append(f"  vol:{int(volume*100)}%", style=C_DIM)
@@ -551,7 +738,7 @@ def make_status_bar(mode: str = "normal", input_text: str = "") -> Text:
 FOOTER_NORMAL = (
     "Tab:panel", "↑↓:nav", "Enter:play", "spc:pause",
     "n/p:skip",  "+/-:vol", "r:repeat",
-    "/:cari",    "d:download", "k/v:lyrics+viz", "q:quit",
+    "/:cari",    "d:yt-dl", "k/v:viz", "a:add-pl", "x:rm-pl", "N:new-pl", "D:del-pl", "q:quit",
 )
 FOOTER_SEARCH = (
     "ketik:filter real-time", "Enter:konfirmasi", "Esc:batal",
@@ -561,6 +748,15 @@ FOOTER_DL_INPUT = (
 )
 FOOTER_DL_RESULTS = (
     "↑↓:pilih", "Enter:download", "d:cari lagi", "Esc:batal",
+)
+FOOTER_NEW_PL = (
+    "ketik:nama playlist", "Enter:buat", "Esc:batal",
+)
+FOOTER_ADD_TO_PL = (
+    "↑↓:pilih playlist", "Enter:tambah", "Esc:batal",
+)
+FOOTER_CONFIRM_DEL = (
+    "Enter:hapus playlist", "Esc:batal",
 )
 
 def make_footer(hints: tuple = FOOTER_NORMAL) -> Text:
@@ -575,17 +771,22 @@ def make_footer(hints: tuple = FOOTER_NORMAL) -> Text:
     return t
 
 # ── Library pane ───────────────────────────────────────
-def make_library_panel(focused: bool) -> Panel:
+def make_library_panel(focused: bool, current_view: str = "") -> Panel:
+    items = build_library_items()
     t = Text()
-    for i, (label, key) in enumerate(LIBRARY_ITEMS):
+    for i, (label, key) in enumerate(items):
         if key.startswith("sep"):
             t.append(f"  {'─'*14}\n", style=C_DIM)
             continue
-        is_sel = (i == lib_sel)
+        is_sel     = (i == lib_sel)
+        is_active  = (key == current_view) or \
+                     (current_view.startswith("pl:") and key == current_view)
         if is_sel and focused:
             t.append(f" ▶ {label}\n", style=f"bold {C_GREEN} {C_SEL_BG}")
         elif is_sel:
             t.append(f" ▶ {label}\n", style=f"{C_WHITE} {C_SEL_BG}")
+        elif is_active:
+            t.append(f" ► {label}\n", style=f"bold {C_CYAN}")
         else:
             t.append(f"   {label}\n", style=C_DIM)
     border = C_GREEN if focused else C_BORDER
@@ -594,11 +795,18 @@ def make_library_panel(focused: bool) -> Panel:
 
 # ── Playlist pane ──────────────────────────────────────
 def make_playlist_panel(src: list[Path], title: str,
-                         focused: bool, sel: int, height: int = 20) -> Panel:
+                         focused: bool, sel: int,
+                         height: int = 20,
+                         is_custom: bool = False,
+                         custom_pl_name: str = "") -> Panel:
     t = Text()
     if not src:
-        t.append("\n  (kosong — taruh .mp3 di folder ./music  atau tekan d untuk download)\n",
-                 style=C_DIM)
+        t.append("\n  (kosong", style=C_DIM)
+        if is_custom:
+            t.append(" — tekan a untuk tambah lagu", style=C_DIM)
+        else:
+            t.append(" — taruh .mp3 di folder ./music atau tekan d untuk download", style=C_DIM)
+        t.append(")\n", style=C_DIM)
     else:
         PAGE       = max(height - 2, 4)
         page_start = (sel // PAGE) * PAGE
@@ -610,18 +818,53 @@ def make_playlist_panel(src: list[Path], title: str,
             is_cur = bool(playlist) and (song == playlist[current_index])
             arrow  = "▶" if is_cur else " "
             name   = song.stem
-            if len(name) > 48: name = name[:46] + ".."
-            line   = f" {arrow} {i+1:>3}  {name:<48}  {dur:>5}  {lrc}\n"
+            if len(name) > 44: name = name[:42] + ".."
+            # Show playlist indicator if in a custom playlist
+            in_pl_names = [pn for pn, stems in custom_playlists.items() if song.stem in stems]
+            pl_tag = f"[{','.join(in_pl_names[:2])}]" if in_pl_names and not is_custom else ""
+            if len(pl_tag) > 14: pl_tag = pl_tag[:12] + "..]"
+            line = f" {arrow} {i+1:>3}  {name:<44}  {dur:>5}  {lrc}"
+            if pl_tag and not is_custom:
+                line += f"  {pl_tag[:14]}"
+            line += "\n"
             if i == sel and focused:     style = f"bold {C_GREEN} {C_SEL_BG}"
             elif i == sel:               style = f"{C_WHITE} {C_SEL_BG}"
             elif is_cur:                 style = f"bold {C_GREEN}"
             else:                        style = C_DIM
             t.append(line, style=style)
+
     border  = C_GREEN if focused else C_BORDER
     cnt     = len(src) if src else 0
-    title_s = (f"[{C_TITLE}]{title} ({cnt})[/{C_TITLE}]" if focused
-               else f"[{C_DIM}]{title} ({cnt})[/{C_DIM}]")
-    return Panel(t, title=title_s, border_style=border, box=box.SIMPLE_HEAVY, padding=(0,0))
+
+    if is_custom:
+        title_text = (f"[{C_TITLE}]♫ {title}[/{C_TITLE}] [{C_DIM}]({cnt} lagu)[/{C_DIM}]"
+                      + f" [{C_DIM}]| a:add  x:del  D:hapus-playlist[/{C_DIM}]")
+    else:
+        title_text = (f"[{C_TITLE}]{title} ({cnt})[/{C_TITLE}]" if focused
+                      else f"[{C_DIM}]{title} ({cnt})[/{C_DIM}]")
+
+    return Panel(t, title=title_text, border_style=border, box=box.SIMPLE_HEAVY, padding=(0,0))
+
+# ── Add-to-playlist selection overlay ─────────────────
+def make_add_to_pl_panel(pl_names: list[str], sel_idx: int, song_name: str) -> Panel:
+    t = Text()
+    t.append(f"\n  Lagu: ", style=C_DIM)
+    t.append(f"{song_name[:50]}\n\n", style=f"bold {C_WHITE}")
+    if not pl_names:
+        t.append("  Belum ada playlist — tekan N untuk buat playlist baru\n", style=C_DIM)
+    else:
+        for i, name in enumerate(pl_names):
+            cnt = len(custom_playlists.get(name, []))
+            already = song_name in custom_playlists.get(name, [])
+            mark = " ✓" if already else "  "
+            if i == sel_idx:
+                t.append(f"  ▶ {name:<30} ({cnt} lagu){mark}\n",
+                         style=f"bold {C_MAGENTA} {C_SEL_BG}")
+            else:
+                t.append(f"    {name:<30} ({cnt} lagu){mark}\n", style=C_DIM)
+    return Panel(t,
+                 title=f"[bold {C_MAGENTA}]Tambah ke Playlist[/bold {C_MAGENTA}]",
+                 border_style=C_MAGENTA, box=box.SIMPLE_HEAVY)
 
 # ── YouTube search results pane ────────────────────────
 def make_yt_panel(results: list[dict], sel: int, searching: bool) -> Panel:
@@ -639,7 +882,6 @@ def make_yt_panel(results: list[dict], sel: int, searching: bool) -> Panel:
             num     = f"{i+1:>2}."
             line_top    = f"  {num} {title}\n"
             line_bottom = f"       {channel}  {dur}\n"
-
             if i == sel:
                 t.append(line_top,    style=f"bold {C_GREEN} {C_SEL_BG}")
                 t.append(line_bottom, style=f"{C_DIM} {C_SEL_BG}")
@@ -647,7 +889,6 @@ def make_yt_panel(results: list[dict], sel: int, searching: bool) -> Panel:
                 t.append(line_top,    style=C_WHITE)
                 t.append(line_bottom, style=C_DIM)
 
-    # download active notice
     with dl_lock:
         dls = dl_status; dlact = dl_active
     if dlact or dls:
@@ -658,10 +899,7 @@ def make_yt_panel(results: list[dict], sel: int, searching: bool) -> Panel:
                  border_style=C_YELLOW, box=box.SIMPLE_HEAVY, padding=(0,0))
 
 # ── Lyrics pane ────────────────────────────────────────
-CONTEXT = 3   # dikurangi dari 5 karena berbagi ruang dengan viz
-
 def _render_lyrics_rows(height: int) -> Text:
-    """Render baris lirik saja (tanpa panel), maks `height` baris."""
     with lyrics_lock: lines = list(lyrics_lines)
     t = Text(justify="center", no_wrap=True)
     if not lines:
@@ -675,7 +913,6 @@ def _render_lyrics_rows(height: int) -> Text:
     half  = max(1, (height - 1) // 2)
     start = max(0, idx - half)
     end   = min(len(lines), start + height)
-    # geser start jika end mentok
     if end - start < height:
         start = max(0, end - height)
     for i in range(start, end):
@@ -688,29 +925,49 @@ def _render_lyrics_rows(height: int) -> Text:
         else:           t.append(f"     {txt}\n",     style=C_DIM)
     return t
 
+_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+def _bar_color(bar_idx: int, total: int) -> str:
+    ratio = bar_idx / max(total - 1, 1)
+    if ratio < 0.35:   return C_GREEN
+    elif ratio < 0.65: return "bright_cyan"
+    else:              return C_YELLOW
+
+def _amp_to_blocks(amp: float, peak: float, height: int) -> list[str]:
+    filled_f = amp * height
+    filled_i = int(filled_f)
+    frac     = filled_f - filled_i
+    col      = []
+    for row in range(height):
+        if row < filled_i:
+            col.append("█")
+        elif row == filled_i:
+            idx = min(8, max(0, round(frac * 8)))
+            col.append(_BLOCKS[idx])
+        else:
+            col.append(" ")
+    peak_row = min(height - 1, int(peak * height))
+    if peak_row > filled_i and col[peak_row] == " ":
+        col[peak_row] = "─"
+    return col
+
 def _render_viz_rows(panel_w: int, bar_h: int) -> Text:
-    """Render baris bar visualizer saja (tanpa panel/label)."""
     with viz_lock:
         amps  = list(viz_data)
         peaks = list(viz_peaks)
-
     bar_w = 2
     n     = min(VIZ_BARS, panel_w // bar_w)
-
     t = Text(no_wrap=True)
-
     if not HAS_VIZ or not viz_running:
         for _ in range(bar_h):
             t.append("\n")
         return t
-
     cols_data = []
     for i in range(n):
         src_i = int(i * VIZ_BARS / n)
         amp   = min(0.95, amps[src_i])
         pk    = min(0.99, peaks[src_i])
         cols_data.append(_amp_to_blocks(amp, pk, bar_h))
-
     for row in range(bar_h - 1, -1, -1):
         t.append(" ")
         for i, col in enumerate(cols_data):
@@ -723,8 +980,6 @@ def _render_viz_rows(panel_w: int, bar_h: int) -> Text:
             else:
                 t.append("  ")
         t.append("\n")
-
-    # freq label
     freq_map = [("20Hz",0.00),("250Hz",0.10),("1kHz",0.35),("4kHz",0.65),("8kHz",0.92)]
     label_line = [" "] * (n * bar_w + 1)
     for lbl, ratio in freq_map:
@@ -737,146 +992,27 @@ def _render_viz_rows(panel_w: int, bar_h: int) -> Text:
     return t
 
 def make_lyric_viz_panel(total_height: int) -> Panel:
-    """Panel gabungan: visualizer (atas) + lirik (bawah)."""
     song_name = playlist[current_index].stem if playlist else ""
     title_str = (f"[{C_TITLE}]Lyrics + Viz[/{C_TITLE}]"
                  + (f"  [{C_DIM}]{song_name[:45]}[/{C_DIM}]" if song_name else ""))
-
-    # Bagi tinggi: viz ~55%, lirik ~45%
-    inner_h  = max(6, total_height - 2)   # kurangi border atas/bawah
+    inner_h  = max(6, total_height - 2)
     viz_h    = max(3, int(inner_h * 0.55))
-    lyr_h    = max(2, inner_h - viz_h - 1)  # -1 untuk garis pemisah
-
+    lyr_h    = max(2, inner_h - viz_h - 1)
     term_w  = console.width or 80
     panel_w = max(20, term_w - 24)
-
     t = Text(no_wrap=True)
-
-    # ── Bagian visualizer ──
     if HAS_VIZ and viz_running:
         t.append_text(_render_viz_rows(panel_w, viz_h))
     else:
-        # placeholder jika viz tidak aktif
-        hint = "tekan v untuk aktifkan visualizer" if HAS_VIZ else "pip install numpy sounddevice"
+        hint = "tekan v untuk aktifkan visualizer" if HAS_VIZ else "pip install numpy pydub"
         for _ in range(viz_h // 2):
             t.append("\n")
         t.append(f"  {hint}\n", style=C_DIM)
         for _ in range(viz_h - viz_h // 2 - 1):
             t.append("\n")
-
-    # ── Garis pemisah ──
     sep_w = min(panel_w, term_w - 4)
     t.append(" " + "─" * sep_w + "\n", style=C_DIM)
-
-    # ── Bagian lirik ──
     t.append_text(_render_lyrics_rows(lyr_h))
-
-    return Panel(t, title=title_str, border_style=C_GREEN, box=box.SIMPLE_HEAVY)
-
-def make_lyric_panel() -> Panel:
-    """Lyric-only panel (tab 3 sekarang diarahkan ke gabungan)."""
-    return make_lyric_viz_panel(total_height=20)
-
-# ── Visualizer pane ────────────────────────────────────
-# Blok Unicode dari bawah ke atas: 1/8 … 8/8
-_BLOCKS = " ▁▂▃▄▅▆▇█"
-
-# Palet warna per ketinggian (bass=hijau, mid=cyan, treble=kuning)
-def _bar_color(bar_idx: int, total: int) -> str:
-    ratio = bar_idx / max(total - 1, 1)
-    if ratio < 0.35:   return C_GREEN          # bass
-    elif ratio < 0.65: return "bright_cyan"    # mid
-    else:              return C_YELLOW         # treble
-
-def _amp_to_blocks(amp: float, peak: float, height: int) -> list[str]:
-    """Konversi amplitudo (0–1) ke kolom karakter tinggi `height` baris."""
-    filled_f = amp * height          # misal 3.6 dari 16
-    filled_i = int(filled_f)         # baris penuh = 3
-    frac     = filled_f - filled_i  # sisa = 0.6
-    col      = []
-    for row in range(height):
-        if row < filled_i:
-            col.append("█")
-        elif row == filled_i:
-            idx = min(8, max(0, round(frac * 8)))
-            col.append(_BLOCKS[idx])
-        else:
-            col.append(" ")
-    # peak dot
-    peak_row = min(height - 1, int(peak * height))
-    if peak_row > filled_i and col[peak_row] == " ":
-        col[peak_row] = "─"
-    return col   # col[0]=bawah, col[height-1]=atas
-
-def make_viz_panel(height: int = 16) -> Panel:
-    with viz_lock:
-        amps  = list(viz_data)
-        peaks = list(viz_peaks)
-
-    song_name = playlist[current_index].stem if playlist else ""
-    title_str = (f"[{C_TITLE}]Visualizer[/{C_TITLE}]"
-                 + (f" [{C_DIM}]— {song_name[:50]}[/{C_DIM}]" if song_name else ""))
-
-    if not HAS_VIZ:
-        t = Text(justify="center")
-        t.append("\n\n  pip install numpy sounddevice\n  untuk mengaktifkan visualizer\n",
-                 style=C_DIM)
-        return Panel(t, title=title_str, border_style=C_GREEN, box=box.SIMPLE_HEAVY)
-
-    if not playlist or (not viz_running and not any(a > 0.01 for a in amps)):
-        t = Text(justify="center")
-        t.append("\n\n  tekan v untuk aktifkan / nonaktifkan visualizer\n", style=C_DIM)
-        return Panel(t, title=title_str, border_style=C_GREEN, box=box.SIMPLE_HEAVY)
-
-    # Hitung lebar panel aktual: terminal - sidebar(20) - border(4)
-    term_w  = console.width or 80
-    panel_w = max(20, term_w - 24)        # lebar konten panel kanan
-    bar_w   = 2                            # setiap bar = 2 karakter lebar
-    n       = min(VIZ_BARS, panel_w // bar_w)  # sesuaikan jumlah bar
-    bar_h   = max(4, height - 4)           # cap tinggi, sisakan 1 baris label
-
-    # Bangun kolom per bar
-    cols_data = []
-    for i in range(n):
-        # Ambil amplitudo bar ke-i (proporsional dari VIZ_BARS)
-        src_i = int(i * VIZ_BARS / n)
-        amp   = min(0.95, amps[src_i])    # cap 95% agar tidak menyentuh batas atas
-        pk    = min(0.99, peaks[src_i])
-        cols_data.append(_amp_to_blocks(amp, pk, bar_h))
-
-    # Render baris demi baris dari atas ke bawah
-    t = Text(no_wrap=True)
-    for row in range(bar_h - 1, -1, -1):
-        t.append(" ")   # margin kiri 1 karakter
-        for i, col in enumerate(cols_data):
-            ch  = col[row]
-            clr = _bar_color(i, n)
-            ch2 = ch + " "   # setiap bar 2 karakter: blok + spasi
-            if ch == "─":
-                t.append(ch2, style=f"{C_WHITE}")
-            elif ch != " ":
-                t.append(ch2, style=f"bold {clr}")
-            else:
-                t.append("  ")   # 2 spasi kosong
-        t.append("\n")
-
-    # Label frekuensi — sesuaikan posisi dengan bar_w=2
-    freq_map = [
-        ("20Hz",  0.00),
-        ("250Hz", 0.10),
-        ("1kHz",  0.35),
-        ("4kHz",  0.65),
-        ("8kHz",  0.92),
-    ]
-    label_line = [" "] * (n * bar_w + 1)
-    for lbl, ratio in freq_map:
-        pos = 1 + int(ratio * n) * bar_w   # +1 untuk margin kiri
-        for j, ch in enumerate(lbl):
-            if pos + j < len(label_line):
-                label_line[pos + j] = ch
-    t.append("".join(label_line), style=C_DIM)
-    t.append("\n")
-
     return Panel(t, title=title_str, border_style=C_GREEN, box=box.SIMPLE_HEAVY)
 
 # ── Full layout ────────────────────────────────────────
@@ -884,7 +1020,12 @@ def build_layout(view: str,
                  pl_src: list[Path], pl_title: str, pl_sel_idx: int,
                  mode: str, input_text: str,
                  yt_res: list[dict], yt_sel: int, yt_srch: bool,
-                 height: int) -> Layout:
+                 height: int,
+                 is_custom_pl: bool = False,
+                 custom_pl_name: str = "",
+                 add_pl_names: list[str] = None,
+                 add_pl_sel: int = 0,
+                 ctx_pl: str = "") -> Layout:
     root = Layout()
     root.split_column(
         Layout(name="tabs",    size=1),
@@ -906,14 +1047,18 @@ def build_layout(view: str,
 
     body   = Layout()
     body_h = max(height - 5, 4)
-    lib_w  = 20
+    lib_w  = 22
     body.split_row(
         Layout(name="lib",  size=lib_w),
         Layout(name="main"),
     )
-    body["lib"].update(make_library_panel(focused=(active_panel == "library")))
+    body["lib"].update(make_library_panel(focused=(active_panel == "library"),
+                                           current_view=view))
 
-    if mode in ("dl_input", "dl_results"):
+    if mode == "add_to_playlist" and add_pl_names is not None:
+        song_name = pl_src[pl_sel_idx].stem if pl_src and 0 <= pl_sel_idx < len(pl_src) else ""
+        body["main"].update(make_add_to_pl_panel(add_pl_names, add_pl_sel, song_name))
+    elif mode in ("dl_input", "dl_results"):
         body["main"].update(make_yt_panel(yt_res, yt_sel, yt_srch))
     elif view in ("karaoke", "viz"):
         body["main"].update(make_lyric_viz_panel(total_height=body_h))
@@ -921,16 +1066,21 @@ def build_layout(view: str,
         body["main"].update(
             make_playlist_panel(pl_src, pl_title,
                                 focused=(active_panel == "playlist"),
-                                sel=pl_sel_idx, height=body_h)
+                                sel=pl_sel_idx, height=body_h,
+                                is_custom=is_custom_pl,
+                                custom_pl_name=custom_pl_name)
         )
 
     root["body"].update(body)
-    root["status"].update(make_status_bar(mode, input_text))
+    root["status"].update(make_status_bar(mode, input_text, ctx_pl))
 
     hint_map = {
-        "search_input": FOOTER_SEARCH,
-        "dl_input":     FOOTER_DL_INPUT,
-        "dl_results":   FOOTER_DL_RESULTS,
+        "search_input":      FOOTER_SEARCH,
+        "dl_input":          FOOTER_DL_INPUT,
+        "dl_results":        FOOTER_DL_RESULTS,
+        "new_playlist":      FOOTER_NEW_PL,
+        "add_to_playlist":   FOOTER_ADD_TO_PL,
+        "confirm_delete_pl": FOOTER_CONFIRM_DEL,
     }
     root["footer"].update(make_footer(hint_map.get(mode, FOOTER_NORMAL)))
     return root
@@ -942,20 +1092,39 @@ def main_loop():
     global active_panel, lib_sel, pl_sel
 
     view      = "library"
-    mode      = "normal"   # normal | search_input | dl_input | dl_results
+    mode      = "normal"
     input_txt = ""
 
-    pl_src   : list[Path] = list(playlist)
-    pl_title  = "All Songs"
-    pl_sel_v  = 0          # navigasi di playlist (lokal, bisa beda dari pl_sel)
+    pl_src        : list[Path] = list(playlist)
+    pl_title       = "All Songs"
+    pl_sel_v       = 0
+    is_custom_view = False
+    current_cpl    = ""      # nama custom playlist yang sedang ditampilkan
 
     yt_sel    = 0
+
+    # add-to-playlist overlay state
+    add_pl_names : list[str] = []
+    add_pl_sel   : int = 0
+
+    # confirm-delete playlist state
+    del_pl_target : str = ""
 
     try:    rows = os.get_terminal_size().lines
     except: rows = 30
 
     def _get_yt():
         with yt_lock: return list(yt_results), yt_searching
+
+    def _refresh_pl_src():
+        """Refresh pl_src dari sumber yang sedang aktif."""
+        nonlocal pl_src, pl_title, is_custom_view
+        if is_custom_view and current_cpl:
+            pl_src  = get_playlist_songs(current_cpl)
+            pl_title = current_cpl
+        else:
+            pl_src  = list(playlist)
+            pl_title = "All Songs"
 
     with Live(console=console, refresh_per_second=20, screen=True) as live:
         while True:
@@ -966,17 +1135,21 @@ def main_loop():
             res, srch = _get_yt()
             live.update(build_layout(
                 view, pl_src, pl_title, pl_sel_v,
-                mode, input_txt, res, yt_sel, srch, rows
+                mode, input_txt, res, yt_sel, srch, rows,
+                is_custom_view, current_cpl,
+                add_pl_names if mode == "add_to_playlist" else None,
+                add_pl_sel,
+                ctx_pl=del_pl_target if mode == "confirm_delete_pl" else ""
             ))
 
             if not msvcrt.kbhit():
-                time.sleep(0.04 if view == "viz" else 0.06)
+                time.sleep(0.04 if view in ("viz","karaoke") else 0.06)
                 continue
 
             k = read_key()
 
             # ══════════════════════════════════════════
-            #  MODE: dl_input — ketik query YouTube
+            #  MODE: dl_input
             # ══════════════════════════════════════════
             if mode == "dl_input":
                 if k == KEY_ESC:
@@ -994,7 +1167,7 @@ def main_loop():
                 continue
 
             # ══════════════════════════════════════════
-            #  MODE: dl_results — pilih hasil YouTube
+            #  MODE: dl_results
             # ══════════════════════════════════════════
             if mode == "dl_results":
                 res, srch = _get_yt()
@@ -1002,7 +1175,6 @@ def main_loop():
                     mode = "normal"; input_txt = ""
                     with yt_lock: yt_results.clear()
                 elif k == "d":
-                    # cari ulang dengan query baru
                     mode = "dl_input"; input_txt = ""
                     with yt_lock: yt_results.clear()
                 elif k == KEY_UP and res:
@@ -1018,28 +1190,34 @@ def main_loop():
                 continue
 
             # ══════════════════════════════════════════
-            #  MODE: search_input — filter real-time
+            #  MODE: search_input
             # ══════════════════════════════════════════
             if mode == "search_input":
                 if k == KEY_ESC:
                     mode = "normal"; input_txt = ""
-                    pl_src = list(playlist); pl_title = "All Songs"; pl_sel_v = 0
+                    _refresh_pl_src(); pl_sel_v = 0
                 elif k == KEY_ENTER:
-                    # konfirmasi, pindah fokus ke playlist
                     mode = "normal"; active_panel = "playlist"
                     pl_sel = pl_sel_v
                 elif k in ("\x08", "backspace"):
                     input_txt = input_txt[:-1]
-                    pl_src = ([p for p in playlist if input_txt.lower() in p.stem.lower()]
-                              if input_txt else list(playlist))
-                    pl_title  = f"/{input_txt}" if input_txt else "All Songs"
+                    if is_custom_view and current_cpl:
+                        base = get_playlist_songs(current_cpl)
+                    else:
+                        base = list(playlist)
+                    pl_src = ([p for p in base if input_txt.lower() in p.stem.lower()]
+                              if input_txt else base)
+                    pl_title  = f"/{input_txt}" if input_txt else ("All Songs" if not is_custom_view else current_cpl)
                     pl_sel_v  = 0
                 elif len(k) == 1 and k.isprintable():
                     input_txt += k
-                    pl_src = [p for p in playlist if input_txt.lower() in p.stem.lower()]
+                    if is_custom_view and current_cpl:
+                        base = get_playlist_songs(current_cpl)
+                    else:
+                        base = list(playlist)
+                    pl_src    = [p for p in base if input_txt.lower() in p.stem.lower()]
                     pl_title  = f"/{input_txt}"
                     pl_sel_v  = 0
-                # navigasi saat search masih aktif
                 elif k == KEY_UP:
                     pl_sel_v = max(0, pl_sel_v - 1)
                 elif k == KEY_DOWN:
@@ -1052,33 +1230,131 @@ def main_loop():
                 continue
 
             # ══════════════════════════════════════════
+            #  MODE: new_playlist — ketik nama playlist baru
+            # ══════════════════════════════════════════
+            if mode == "new_playlist":
+                if k == KEY_ESC:
+                    mode = "normal"; input_txt = ""
+                elif k == KEY_ENTER:
+                    if input_txt.strip():
+                        ok = create_playlist(input_txt.strip())
+                        if ok:
+                            set_feedback(f"Playlist '{input_txt.strip()}' dibuat!")
+                        else:
+                            set_feedback(f"Playlist '{input_txt.strip()}' sudah ada!")
+                    mode = "normal"; input_txt = ""
+                elif k in ("\x08", "backspace"):
+                    input_txt = input_txt[:-1]
+                elif len(k) == 1 and k.isprintable():
+                    input_txt += k
+                continue
+
+            # ══════════════════════════════════════════
+            #  MODE: add_to_playlist — pilih playlist tujuan
+            # ══════════════════════════════════════════
+            if mode == "add_to_playlist":
+                if k == KEY_ESC:
+                    mode = "normal"; input_txt = ""
+                elif k == KEY_UP:
+                    add_pl_sel = max(0, add_pl_sel - 1)
+                elif k == KEY_DOWN:
+                    add_pl_sel = min(len(add_pl_names) - 1, add_pl_sel + 1) if add_pl_names else 0
+                elif k == KEY_ENTER and add_pl_names:
+                    target_pl  = add_pl_names[add_pl_sel]
+                    if pl_src and 0 <= pl_sel_v < len(pl_src):
+                        ok = add_song_to_playlist(target_pl, pl_src[pl_sel_v])
+                        if ok:
+                            set_feedback(f"Ditambahkan ke '{target_pl}'!")
+                        else:
+                            set_feedback(f"Sudah ada di '{target_pl}'")
+                    mode = "normal"; input_txt = ""
+                    _refresh_pl_src()
+                continue
+
+            # ══════════════════════════════════════════
+            #  MODE: confirm_delete_pl
+            # ══════════════════════════════════════════
+            if mode == "confirm_delete_pl":
+                if k == KEY_ESC:
+                    mode = "normal"; del_pl_target = ""
+                elif k == KEY_ENTER and del_pl_target:
+                    delete_playlist(del_pl_target)
+                    set_feedback(f"Playlist '{del_pl_target}' dihapus!")
+                    # kembali ke All Songs jika yang dihapus sedang ditampilkan
+                    nonlocal_reset = (current_cpl == del_pl_target)
+                    del_pl_target = ""
+                    mode = "normal"
+                    if nonlocal_reset:
+                        is_custom_view = False
+                        current_cpl = ""
+                        view = "library"
+                        pl_src   = list(playlist)
+                        pl_title = "All Songs"
+                        pl_sel_v = 0
+                continue
+
+            # ══════════════════════════════════════════
             #  MODE: normal — hotkey global
             # ══════════════════════════════════════════
-            if   k in ("q",):                  stop_music(); break
-            elif k == KEY_ESC:                 stop_music(); break
-            elif k == KEY_SPACE:               toggle_pause()
-            elif k == "n":                     next_song()
-            elif k == "p":                     prev_song()
-            elif k in ("+", "="):              change_volume(0.05)
-            elif k == "-":                     change_volume(-0.05)
+            if   k in ("q",):     stop_music(); break
+            elif k == KEY_ESC:    stop_music(); break
+            elif k == KEY_SPACE:  toggle_pause()
+            elif k == "n":        next_song()
+            elif k == "p":        prev_song()
+            elif k in ("+", "="): change_volume(0.05)
+            elif k == "-":        change_volume(-0.05)
             elif k == "r":
                 toggle_repeat()
-                # refresh playlist supaya lagu baru muncul setelah download
-                pl_src = list(playlist); pl_title = "All Songs"
+                _refresh_pl_src()
             elif k == "/":
                 mode = "search_input"; input_txt = ""
-                pl_src = list(playlist); pl_title = "All Songs"
+                _refresh_pl_src()
                 pl_sel_v = pl_sel; active_panel = "playlist"
             elif k == "d":
                 if not dl_active:
                     mode = "dl_input"; input_txt = ""
                     with yt_lock: yt_results.clear()
-            elif k == "1":    view = "library"
+
+            # ── Playlist management hotkeys ──
+            elif k == "n":  # buat playlist baru (shift-N → 'n' di read_key)
+                pass  # ditangani di bawah dengan "N" lowercase
+            elif k == "N" or k == "\x0e":  # N atau Ctrl+N
+                mode = "new_playlist"; input_txt = ""
+
+            elif k == "a":
+                # Add lagu yang dipilih ke custom playlist
+                if pl_src and 0 <= pl_sel_v < len(pl_src):
+                    add_pl_names = get_playlist_names()
+                    add_pl_sel   = 0
+                    mode = "add_to_playlist"; input_txt = ""
+                else:
+                    set_feedback("Pilih lagu terlebih dahulu")
+
+            elif k == "x":
+                # Hapus lagu dari custom playlist (hanya jika sedang di custom playlist)
+                if is_custom_view and current_cpl and pl_src and 0 <= pl_sel_v < len(pl_src):
+                    song = pl_src[pl_sel_v]
+                    ok = remove_song_from_playlist(current_cpl, song)
+                    if ok:
+                        set_feedback(f"'{song.stem[:30]}' dihapus dari '{current_cpl}'")
+                    _refresh_pl_src()
+                    pl_sel_v = min(pl_sel_v, max(0, len(pl_src) - 1))
+                else:
+                    set_feedback("x: hanya di view custom playlist")
+
+            elif k == "D" or k == "\x04":  # D atau Ctrl+D
+                # Hapus custom playlist yang sedang dilihat
+                if is_custom_view and current_cpl:
+                    del_pl_target = current_cpl
+                    mode = "confirm_delete_pl"
+                else:
+                    set_feedback("Buka custom playlist dulu (klik di Library)")
+
+            elif k == "1":    view = "library"; is_custom_view = False; current_cpl = ""
             elif k == "2":    view = "library"; active_panel = "playlist"
             elif k == "3":    view = "karaoke"; start_visualizer()
             elif k in ("k", "v"):
                 if view == "karaoke":
-                    # toggle visualizer on/off saat sudah di tab ini
                     if viz_running: stop_visualizer()
                     else:           start_visualizer()
                 else:
@@ -1089,40 +1365,66 @@ def main_loop():
 
             elif k == KEY_UP:
                 if active_panel == "library":
-                    lib_sel = (lib_sel - 1) % len(LIBRARY_ITEMS)
-                    while LIBRARY_ITEMS[lib_sel][1].startswith("sep"):
-                        lib_sel = (lib_sel - 1) % len(LIBRARY_ITEMS)
+                    items = build_library_items()
+                    lib_sel = (lib_sel - 1) % len(items)
+                    while items[lib_sel][1].startswith("sep"):
+                        lib_sel = (lib_sel - 1) % len(items)
                 elif pl_src:
                     pl_sel_v = max(0, pl_sel_v - 1)
                     pl_sel   = pl_sel_v
 
             elif k == KEY_DOWN:
                 if active_panel == "library":
-                    lib_sel = (lib_sel + 1) % len(LIBRARY_ITEMS)
-                    while LIBRARY_ITEMS[lib_sel][1].startswith("sep"):
-                        lib_sel = (lib_sel + 1) % len(LIBRARY_ITEMS)
+                    items = build_library_items()
+                    lib_sel = (lib_sel + 1) % len(items)
+                    while items[lib_sel][1].startswith("sep"):
+                        lib_sel = (lib_sel + 1) % len(items)
                 elif pl_src:
                     pl_sel_v = min(len(pl_src) - 1, pl_sel_v + 1)
                     pl_sel   = pl_sel_v
 
             elif k == KEY_ENTER:
                 if active_panel == "library":
-                    action = LIBRARY_ITEMS[lib_sel][1]
+                    items  = build_library_items()
+                    action = items[lib_sel][1]
+
                     if action == "search":
                         mode = "search_input"; input_txt = ""
-                        pl_src = list(playlist); pl_title = "All Songs"
+                        _refresh_pl_src()
                         pl_sel_v = pl_sel; active_panel = "playlist"
+
                     elif action == "download":
                         if not dl_active:
                             mode = "dl_input"; input_txt = ""
                             with yt_lock: yt_results.clear()
-                    elif action == "karaoke":
+
+                    elif action == "karaoke" or action == "viz":
                         view = "karaoke"; start_visualizer()
-                    elif action == "viz":
-                        view = "karaoke"; start_visualizer()
+
+                    elif action == "new_playlist":
+                        mode = "new_playlist"; input_txt = ""
+
+                    elif action.startswith("pl:"):
+                        # buka custom playlist
+                        pl_name        = action[3:]
+                        current_cpl    = pl_name
+                        is_custom_view = True
+                        pl_src         = get_playlist_songs(pl_name)
+                        pl_title       = pl_name
+                        pl_sel_v       = 0
+                        view           = "playlist"
+                        active_panel   = "playlist"
+
                     else:
-                        pl_src = list(playlist); pl_title = "All Songs"
-                        pl_sel_v = 0; pl_sel = 0; active_panel = "playlist"
+                        # All Songs
+                        is_custom_view = False
+                        current_cpl    = ""
+                        pl_src   = list(playlist)
+                        pl_title = "All Songs"
+                        pl_sel_v = 0
+                        pl_sel   = 0
+                        active_panel = "playlist"
+
                 elif pl_src:
                     try:
                         real_idx = playlist.index(pl_src[pl_sel_v])
@@ -1139,17 +1441,21 @@ def main_loop():
 # ══════════════════════════════════════════════════════
 if __name__ == "__main__":
     os.system("cls")
+    load_playlists()
     console.print(f"[{C_DIM}]scanning ./music ...[/{C_DIM}]")
     scan_music()
     lrc = sum(1 for p in playlist if p.with_suffix(".lrc").exists())
     console.print(f"[{C_GREEN}]{len(playlist)} songs[/{C_GREEN}] [{C_DIM}]({lrc} .lrc)[/{C_DIM}]")
+    pln = len(custom_playlists)
+    if pln:
+        console.print(f"[{C_CYAN}]{pln} custom playlist(s)[/{C_CYAN}]")
     if not HAS_LYRICS:
         console.print(f"[{C_YELLOW}]tip: pip install syncedlyrics[/{C_YELLOW}]")
     if not HAS_YTDLP:
         console.print(f"[{C_YELLOW}]tip: pip install yt-dlp  (untuk download YouTube)[/{C_YELLOW}]")
     if not HAS_VIZ:
-        console.print(f"[{C_YELLOW}]tip: pip install numpy sounddevice  (untuk visualizer)[/{C_YELLOW}]")
+        console.print(f"[{C_YELLOW}]tip: pip install numpy pydub  (untuk visualizer)[/{C_YELLOW}]")
     time.sleep(0.5)
     main_loop()
 
-# pip install pygame rich syncedlyrics mutagen yt-dlp numpy sounddevice
+# pip install pygame rich syncedlyrics mutagen yt-dlp numpy pydub
